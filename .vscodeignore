@@ -1,0 +1,17 @@
+.vscode/**
+.vscode-test/**
+src/**
+.gitignore
+tsconfig.json
+**/*.map
+**/*.ts
+!out/**/*.js
+node_modules/**
+*.md
+.cursor/**
+*.vsix
+icon.png
+!media/icon.png
+media/icon-128.png
+media/icon-256.png
+media/blossom-activity.png

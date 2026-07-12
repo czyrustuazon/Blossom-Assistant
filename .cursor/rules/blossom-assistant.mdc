@@ -1,0 +1,43 @@
+---
+description: Blossom Assistant extension architecture and product rules
+globs: src/**/*.ts
+alwaysApply: false
+---
+
+# Blossom Assistant (extension)
+
+Client for ChatRouter at `http://127.0.0.1:8081`. Local-first coding.
+
+## Ownership (do not invert)
+
+- **Extension:** editor attach, repo knowledge, disk checks (`fs.access`), Apply / auto-apply / auto-save, fence→file mapping, UI summary.
+- **ChatRouter:** routing (persona/coder/cloud), RAG, coding_rules, GGUF hot-swap.
+- ChatRouter cannot see the project disk unless the extension puts facts in the prompt. **Disk truth = extension.**
+
+## Critical rules
+
+- **CREATE vs EDIT:** new files get their own fence (`path=contacts.html`); never dump a new page into attached `index.html`.
+- Multi-file = multiple path-labeled fences (or `**file.ext**` heading above fence). Apply must create all of them.
+- Parse path from: `path=…`, bold/heading above fence, HTML comments — **never** invent paths from `<title>` (caused `validhtmlexample.html`).
+- Auto-apply + auto-save must land on disk without Ctrl+S.
+- After coding: Summary card with model notes + backend (Local coder / Claude / Gemini). No "Done — applied…" spam.
+- Link / unused-file asks:
+  - Inject `[LINK CHECK]` with EXISTS/MISSING from real `fs.access`.
+  - Never remove EXISTS links.
+  - "Delete unused / safe to delete" = extension proposes `kind: delete` for `[UNUSED FILES]` and Apply/Auto-apply unlinks (model fences ignored in that mode).
+  - Explicit `DELETE path=file.ext` / ```delete path=…``` also become delete Apply cards.
+  - Inject clear `[TASK BRIEF]` so the model does not confuse orphans with dead links.
+
+## Key files
+
+- `src/agent/editorContext.ts` — LINK CHECK, UNUSED FILES, task brief
+- `src/agent/applyFromResponse.ts` — fence→Apply
+- `src/agent/orchestrator.ts` — turn pipeline
+- `src/agent/tools.ts` — apply + save
+- `src/chat/ChatPanel.ts` — UI
+
+Backend rules: `Documents/Blossom/PythonScripts/` — coordinate; do not duplicate disk I/O there.
+
+## When changing the plugin
+
+Prefer verified context injection over hoping the local coder "knows." Language-agnostic path fences + disk checks; HTML href/orphan helpers are OK as specialized cases. After changes: `npm run compile`, reload, test create+edit, link-check with existing siblings, unused delete candidate, auto-apply saves.

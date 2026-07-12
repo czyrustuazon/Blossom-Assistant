@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+
+# Compiled extension output
+out/
+dist/
+*.tsbuildinfo
+
+# Packaged VSIX builds
+*.vsix
+
+# Source maps (generated)
+*.map
+
+# Logs / debug
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / tooling (local)
+.idea/
+*.swp
+*.swo
+*~
+
+# VS Code test runner
+.vscode-test/
+
+# Optional local Cursor noise (rules under .cursor/rules may be committed intentionally)
+# Uncomment if you don't want agent artifacts tracked:
+# .cursor/
+
+# Coverage / temp
+coverage/
+tmp/
+temp/
+*.tmp

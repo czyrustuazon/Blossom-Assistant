@@ -1,0 +1,200 @@
+{
+  "name": "blossom-assistant",
+  "displayName": "Blossom Assistant",
+  "description": "Local coding assistant for VS Code via Blossom ChatRouter (or Ollama).",
+  "version": "0.1.38",
+  "publisher": "blossom",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:blossom.openChat",
+    "onCommand:blossom.refreshPersona",
+    "onCommand:blossom.showPersona",
+    "onCommand:blossom.refreshRepoKnowledge",
+    "onCommand:blossom.showRepoKnowledge"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "blossom.openChat",
+        "title": "Open New Chat",
+        "category": "Blossom",
+        "icon": {
+          "light": "media/icon.png",
+          "dark": "media/icon.png"
+        }
+      },
+      {
+        "command": "blossom.setGeminiApiKey",
+        "title": "Set Gemini API Key",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.showGeminiSpend",
+        "title": "Show Gemini Spend",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.checkOllama",
+        "title": "Check LLM Connection",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.refreshPersona",
+        "title": "Refresh Persona from Ollama",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.showPersona",
+        "title": "Show Loaded Persona",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.refreshRepoKnowledge",
+        "title": "Refresh Repo Knowledge",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.showRepoKnowledge",
+        "title": "Show Repo Knowledge",
+        "category": "Blossom"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "blossom.openChat"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "blossom.openChat",
+          "group": "navigation@0",
+          "when": "true"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Blossom Assistant",
+      "properties": {
+        "blossom.backend": {
+          "type": "string",
+          "enum": ["chatRouter", "ollama"],
+          "default": "chatRouter",
+          "description": "LLM backend. 'chatRouter' = Blossom ChatRouter (OpenAI-compatible on :8081). 'ollama' = native Ollama /api/chat."
+        },
+        "blossom.api.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8081",
+          "description": "Base URL for the LLM API. ChatRouter default: http://127.0.0.1:8081. Ollama: http://localhost:11434."
+        },
+        "blossom.ollama.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8081",
+          "description": "Deprecated alias for blossom.api.baseUrl."
+        },
+        "blossom.models.coding": {
+          "type": "string",
+          "default": "local-coder",
+          "description": "Model id sent in requests (ChatRouter mostly routes by message content)."
+        },
+        "blossom.models.rp": {
+          "type": "string",
+          "default": "local-voice",
+          "description": "Deprecated — plugin is coding-only. Kept for older settings."
+        },
+        "blossom.models.japanese": {
+          "type": "string",
+          "default": "local-voice",
+          "description": "Deprecated — plugin is coding-only. Kept for older settings."
+        },
+        "blossom.persona.source": {
+          "type": "string",
+          "enum": ["router", "ollama", "settings", "ollama+settings"],
+          "default": "router",
+          "description": "Optional personality source. 'router' = ChatRouter CompanionEngine (recommended)."
+        },
+        "blossom.persona.model": {
+          "type": "string",
+          "default": "",
+          "description": "Ollama model when persona.source is ollama. Empty = models.coding."
+        },
+        "blossom.persona.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Optional extra instructions. Leave empty when using ChatRouter."
+        },
+        "blossom.ui.displayName": {
+          "type": "string",
+          "default": "Blossom Assistant",
+          "description": "Display name shown in the chat header and panel tab."
+        },
+        "blossom.ui.iconPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a custom icon image (PNG/JPG/SVG/WebP). Absolute path or workspace-relative (e.g. assets/my-icon.png). Empty = built-in cherry blossom."
+        },
+        "blossom.gemini.model": {
+          "type": "string",
+          "default": "gemini-2.0-flash",
+          "description": "Gemini model for confirm-gated Blossom escalations."
+        },
+        "blossom.gemini.inputPricePer1M": {
+          "type": "number",
+          "default": 0.1,
+          "description": "Estimated USD per 1M input tokens."
+        },
+        "blossom.gemini.outputPricePer1M": {
+          "type": "number",
+          "default": 0.4,
+          "description": "Estimated USD per 1M output tokens."
+        },
+        "blossom.edits.autoApply": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), Blossom writes proposed file creates/edits to disk automatically (no Apply click). Toggle per-session with the Auto-apply chip or by saying 'auto-apply' / 'stop auto-apply'."
+        },
+        "blossom.edits.autoSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "After Apply or Auto-apply, save the file to disk immediately (no extra Ctrl+S)."
+        },
+        "blossom.siblingPeek.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow read-only peek into related sibling folders."
+        },
+        "blossom.siblingPeek.maxFiles": {
+          "type": "number",
+          "default": 20,
+          "description": "Max entries from a related-folder listing."
+        },
+        "blossom.siblingPeek.maxBytes": {
+          "type": "number",
+          "default": 100000,
+          "description": "Max bytes read from a related-folder file."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc --noEmit -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
