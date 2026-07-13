@@ -407,10 +407,23 @@ async function* streamChatRouter(
 
     const choices = data.choices as
       | Array<{
-          delta?: { content?: string };
-          message?: { content?: string };
+          delta?: { content?: string; reasoning_content?: string };
+          message?: { content?: string; reasoning_content?: string };
         }>
       | undefined;
+    const deltaObj = choices?.[0]?.delta;
+    const reasoningDelta =
+      typeof deltaObj?.reasoning_content === "string"
+        ? deltaObj.reasoning_content
+        : "";
+    if (reasoningDelta) {
+      yield {
+        thought: {
+          step: "model_reasoning",
+          message: reasoningDelta,
+        },
+      };
+    }
     const delta =
       choices?.[0]?.delta?.content ??
       (typeof choices?.[0]?.message?.content === "string"
@@ -505,10 +518,11 @@ async function chatCompletionsOpenAI(req: ChatRequest): Promise<{
   }
 
   const data = (await res.json()) as {
-    blossom_thoughts?: BlossomThought[];
+    blossom_thoughts?: Array<Record<string, unknown>>;
     choices?: Array<{
       message?: {
         content?: string | Array<{ type?: string; text?: string }>;
+        reasoning_content?: string;
         tool_calls?: Array<{
           function?: { name?: string; arguments?: string | Record<string, unknown> };
         }>;
@@ -527,10 +541,26 @@ async function chatCompletionsOpenAI(req: ChatRequest): Promise<{
     }))
     .filter((tc) => tc.function.name);
 
+  const thoughts = (data.blossom_thoughts ?? []).map((t) => normalizeThought(t));
+  const reasoning =
+    message?.reasoning_content?.trim() ?? "";
+  if (
+    reasoning &&
+    !thoughts.some(
+      (t) =>
+        t.step === "model_reasoning" &&
+        (t.message === reasoning ||
+          t.message?.includes(reasoning.slice(0, 80)) ||
+          reasoning.startsWith(t.message?.slice(0, 80) ?? ""))
+    )
+  ) {
+    thoughts.push({ step: "model_reasoning", message: reasoning });
+  }
+
   return {
     content,
     toolCalls,
-    thoughts: data.blossom_thoughts,
+    thoughts: thoughts.length > 0 ? thoughts : undefined,
   };
 }
 

@@ -405,9 +405,38 @@ class BlossomChatSession {
       color: var(--muted);
       font-size: 0.85em;
       flex-shrink: 0;
+      flex-wrap: nowrap;
     }
     .busy-row.on {
       display: flex;
+    }
+    .busy-reasoning-wrap {
+      display: none;
+      align-items: baseline;
+      gap: 6px;
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+    }
+    .busy-reasoning-wrap.on {
+      display: flex;
+    }
+    .busy-reasoning-label {
+      flex-shrink: 0;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+    .busy-reasoning {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-style: italic;
+      opacity: 0.9;
     }
     .spinner {
       width: 14px;
@@ -675,6 +704,24 @@ class BlossomChatSession {
       opacity: 0.75;
       margin-right: 6px;
     }
+    .thoughts li.reasoning-entry {
+      margin: 8px 0 6px;
+    }
+    .thoughts .reasoning-body {
+      white-space: pre-wrap;
+      word-break: break-word;
+      display: block;
+      margin-top: 4px;
+      padding: 6px 8px;
+      border-left: 2px solid color-mix(in srgb, var(--accent) 55%, var(--border));
+      background: color-mix(in srgb, var(--fg) 5%, var(--card));
+      border-radius: 0 4px 4px 0;
+      font-size: 0.88em;
+      line-height: 1.45;
+      opacity: 0.92;
+      max-height: 240px;
+      overflow: auto;
+    }
     .edit pre {
       max-height: 160px;
       overflow: auto;
@@ -729,6 +776,10 @@ class BlossomChatSession {
     <div class="busy-row" id="busyRow" aria-hidden="true">
       <div class="spinner" id="busySpinner" title="Working…"></div>
       <span id="busyLabel">Working…</span>
+      <div id="busyReasoningWrap" class="busy-reasoning-wrap" aria-live="polite">
+        <span class="busy-reasoning-label">Reasoning</span>
+        <span id="busyReasoning" class="busy-reasoning"></span>
+      </div>
     </div>
   </div>
   <div class="composer">
@@ -747,7 +798,83 @@ class BlossomChatSession {
     let streamingEl = null;
     let thoughtsEl = null;
     let thoughtsList = null;
+    let reasoningLines = [];
+    let reasoningLineIdx = 0;
+    let reasoningTimer = null;
     let busy = false;
+
+    function splitReasoningLines(text) {
+      const raw = (text || '').trim();
+      if (!raw) return [];
+      const byNewline = raw.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);
+      if (byNewline.length > 1) return byNewline;
+      const sentences = raw.split(/(?<=[.!?])\\s+/).map((s) => s.trim()).filter(Boolean);
+      return sentences.length > 1 ? sentences : [raw];
+    }
+
+    function showReasoningLine() {
+      const wrap = document.getElementById('busyReasoningWrap');
+      const el = document.getElementById('busyReasoning');
+      const label = document.getElementById('busyLabel');
+      if (!wrap || !el) return;
+      if (reasoningLines.length === 0) {
+        wrap.classList.remove('on');
+        el.textContent = '';
+        if (label) label.style.display = '';
+        return;
+      }
+      wrap.classList.add('on');
+      if (label) label.style.display = 'none';
+      const idx = Math.min(reasoningLineIdx, reasoningLines.length - 1);
+      el.textContent = reasoningLines[idx];
+    }
+
+    function startReasoningTicker() {
+      if (reasoningTimer) return;
+      reasoningTimer = setInterval(() => {
+        if (reasoningLineIdx < reasoningLines.length - 1) {
+          reasoningLineIdx += 1;
+          showReasoningLine();
+        }
+      }, 5000);
+    }
+
+    function stopReasoningTicker() {
+      if (reasoningTimer) {
+        clearInterval(reasoningTimer);
+        reasoningTimer = null;
+      }
+    }
+
+    function resetReasoningTicker() {
+      stopReasoningTicker();
+      reasoningLines = [];
+      reasoningLineIdx = 0;
+      const wrap = document.getElementById('busyReasoningWrap');
+      const el = document.getElementById('busyReasoning');
+      const label = document.getElementById('busyLabel');
+      if (wrap) wrap.classList.remove('on');
+      if (el) el.textContent = '';
+      if (label) label.style.display = '';
+    }
+
+    function setReasoningTicker(text) {
+      const lines = splitReasoningLines(text);
+      if (lines.length === 0) {
+        resetReasoningTicker();
+        return;
+      }
+      const prevLen = reasoningLines.length;
+      reasoningLines = lines;
+      if (prevLen === 0) {
+        reasoningLineIdx = 0;
+        showReasoningLine();
+        startReasoningTicker();
+      } else if (reasoningLineIdx >= reasoningLines.length) {
+        reasoningLineIdx = reasoningLines.length - 1;
+        showReasoningLine();
+      }
+    }
 
     function ensureThoughts() {
       if (thoughtsEl) return;
@@ -764,6 +891,11 @@ class BlossomChatSession {
     }
 
     function addThought(step, message, local) {
+      if (step === 'model_reasoning') {
+        setReasoningTicker(message);
+        pinBusyToBottom();
+        return;
+      }
       ensureThoughts();
       const li = document.createElement('li');
       if (step) {
@@ -772,7 +904,9 @@ class BlossomChatSession {
         s.textContent = local ? '[' + step + ']' : step;
         li.appendChild(s);
       }
-      li.appendChild(document.createTextNode(message));
+      const body = document.createElement('span');
+      body.textContent = message;
+      li.appendChild(body);
       thoughtsList.appendChild(li);
       const sum = thoughtsEl.querySelector('summary');
       const n = thoughtsList.children.length;
@@ -1069,7 +1203,10 @@ class BlossomChatSession {
       const row = document.getElementById('busyRow');
       if (row) {
         if (v) row.classList.add('on');
-        else row.classList.remove('on');
+        else {
+          row.classList.remove('on');
+          resetReasoningTicker();
+        }
         row.setAttribute('aria-hidden', v ? 'false' : 'true');
       }
       pinBusyToBottom();
@@ -1135,12 +1272,14 @@ class BlossomChatSession {
         case 'assistantStart':
           thoughtsEl = null;
           thoughtsList = null;
+          resetReasoningTicker();
           streamingEl = null;
           break;
         case 'thought':
           addThought(msg.step || '', msg.message || '', false);
           break;
         case 'token':
+          resetReasoningTicker();
           if (thoughtsEl && thoughtsEl.open) {
             // collapse trail once answer starts flowing
             thoughtsEl.open = false;
@@ -1277,13 +1416,17 @@ class BlossomChatSession {
           break;
         case 'cleared':
           messagesEl.innerHTML = '';
+          thoughtsEl = null;
+          thoughtsList = null;
+          resetReasoningTicker();
+          streamingEl = null;
           // Recreate busy row after clear (innerHTML wiped it)
           {
             const row = document.createElement('div');
             row.className = 'busy-row';
             row.id = 'busyRow';
             row.setAttribute('aria-hidden', 'true');
-            row.innerHTML = '<div class="spinner" id="busySpinner" title="Working…"></div><span id="busyLabel">Working…</span>';
+            row.innerHTML = '<div class="spinner" id="busySpinner" title="Working…"></div><span id="busyLabel">Working…</span><div id="busyReasoningWrap" class="busy-reasoning-wrap" aria-live="polite"><span class="busy-reasoning-label">Reasoning</span><span id="busyReasoning" class="busy-reasoning"></span></div>';
             messagesEl.appendChild(row);
           }
           break;

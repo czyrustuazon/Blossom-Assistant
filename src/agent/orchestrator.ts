@@ -88,7 +88,8 @@ function isUsefulThought(thought: BlossomThought): boolean {
     step === "fallback" ||
     step === "cloud_error" ||
     step === "cloud" ||
-    step === "intel_ready"
+    step === "intel_ready" ||
+    step === "model_reasoning"
   ) {
     return true;
   }
@@ -446,6 +447,28 @@ export class AgentOrchestrator {
     let intelSource: string | undefined;
     let intelLabel: string | undefined;
     const seenThoughts = new Set<string>();
+    let reasoningAccum = "";
+
+    const mergeReasoning = (incoming: string): string => {
+      const msg = incoming;
+      if (!msg) {
+        return reasoningAccum;
+      }
+      if (!reasoningAccum) {
+        return msg;
+      }
+      if (msg === reasoningAccum || reasoningAccum.endsWith(msg)) {
+        return reasoningAccum;
+      }
+      if (msg.startsWith(reasoningAccum)) {
+        return msg;
+      }
+      if (reasoningAccum.startsWith(msg)) {
+        return reasoningAccum;
+      }
+      // Streaming delta from reasoning_content
+      return reasoningAccum + msg;
+    };
 
     const noteThought = (t: BlossomThought): void => {
       const fromFields = t.source || t.provider;
@@ -463,7 +486,24 @@ export class AgentOrchestrator {
           intelLabel = labelIntelSource(m[1]);
         }
       }
-      const key = `${t.step ?? ""}:${t.message}`;
+
+      if (step === "model_reasoning") {
+        const merged = mergeReasoning(t.message || "");
+        if (!merged || merged === reasoningAccum) {
+          return;
+        }
+        reasoningAccum = merged;
+        events.onThought({
+          step: "model_reasoning",
+          message: reasoningAccum,
+          source: t.source,
+          provider: t.provider,
+        });
+        return;
+      }
+
+      const prefix = (t.message || "").slice(0, 80);
+      const key = `${t.step ?? ""}:${prefix}`;
       if (!seenThoughts.has(key) && isUsefulThought(t)) {
         seenThoughts.add(key);
         events.onThought(t);
