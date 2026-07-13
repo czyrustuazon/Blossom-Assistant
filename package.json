@@ -2,7 +2,7 @@
   "name": "blossom-assistant",
   "displayName": "Blossom Assistant",
   "description": "Local coding assistant for VS Code via Blossom ChatRouter (or Ollama).",
-  "version": "0.1.38",
+  "version": "0.1.44",
   "publisher": "blossom",
   "icon": "media/icon.png",
   "engines": {

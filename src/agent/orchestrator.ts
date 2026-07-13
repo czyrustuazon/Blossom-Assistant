@@ -19,6 +19,7 @@ import {
   type CodingSummaryInfo,
   parseModelSummaryNotes,
   proposeEditsFromAssistantReply,
+  resolveUserDeleteTargets,
   stripCodingSummarySection,
 } from "./applyFromResponse";
 import { parseAutoApplyIntent } from "./autoApply";
@@ -300,11 +301,38 @@ export class AgentOrchestrator {
         }
 
         if (!enriched.safeDeleteIntent) {
+          const deletePlan = await resolveUserDeleteTargets(
+            userText,
+            enriched.attachedPaths
+          );
+          for (const miss of deletePlan.missing) {
+            events.onStatus(
+              `No workspace file matching "${miss}" to delete.`
+            );
+          }
+          for (const amb of deletePlan.ambiguous) {
+            events.onStatus(
+              `Ambiguous delete "${amb.hint}" — matches ${amb.candidates.join(", ")}. Not deleting.`
+            );
+          }
+          if (deletePlan.resolved.length > 0) {
+            events.onStatus(
+              `Delete target(s) from your ask: ${deletePlan.resolved.join(", ")}`
+            );
+          }
+
           const proposed = await proposeEditsFromAssistantReply(
             assistantText,
             enriched.attachedPaths,
             async (edit) => {
               await this.deliverPendingEdit(edit, events, applyNow);
+            },
+            deletePlan.resolved,
+            {
+              lockDeletesToUserTargets: deletePlan.resolved.length > 0,
+              onSkippedDelete: (path, reason) => {
+                events.onStatus(`Skipped delete of ${path} (${reason}).`);
+              },
             }
           );
           codingEdits = proposed.edits;

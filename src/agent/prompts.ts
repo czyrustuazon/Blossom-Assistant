@@ -96,6 +96,8 @@ DELETE path=contacts.html
 DELETE
 \`\`\`
 
+Or body \`DELETE_FILE\` / \`DELETE FILE\` under a path heading (e.g. **end.html** then fence).
+
 Hard rules for DELETE:
 - Only delete paths the user asked to remove, or paths listed under [UNUSED FILES] when they asked to delete unused/orphan files.
 - Never delete the attached/open file the user is editing unless they explicitly ask.

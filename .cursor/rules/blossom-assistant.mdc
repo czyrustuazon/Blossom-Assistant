@@ -25,7 +25,8 @@ Client for ChatRouter at `http://127.0.0.1:8081`. Local-first coding.
   - Inject `[LINK CHECK]` with EXISTS/MISSING from real `fs.access`.
   - Never remove EXISTS links.
   - "Delete unused / safe to delete" = extension proposes `kind: delete` for `[UNUSED FILES]` and Apply/Auto-apply unlinks (model fences ignored in that mode).
-  - Explicit `DELETE path=file.ext` / ```delete path=…``` also become delete Apply cards.
+  - Explicit deletes: resolve user name (e.g. `marks` → `marks.html`) against workspace disk; lock deletes to those targets so the model cannot delete a different file.
+  - Explicit `DELETE path=file.ext` / ```delete path=…``` also become delete Apply cards when not locked out.
   - Inject clear `[TASK BRIEF]` so the model does not confuse orphans with dead links.
 
 ## Key files

@@ -68,6 +68,8 @@ class BlossomChatSession {
   private readonly tabIndex: number;
   /** Short label from the first user ask — shown as the editor tab title. */
   private topicSummary: string | undefined;
+  /** Last user ask — attached to error events for Retry. */
+  private lastAsk = "";
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -221,6 +223,7 @@ class BlossomChatSession {
         if (!text) {
           return;
         }
+        this.lastAsk = text;
         this.setTopicFromAsk(text);
         this.post({ type: "assistantStart" });
         await this.orchestrator.handleUserMessage(text, {
@@ -228,12 +231,18 @@ class BlossomChatSession {
           onMode: (mode, model, source) =>
             this.post({ type: "mode", mode, model, source }),
           onToken: (delta) => this.post({ type: "token", text: delta }),
-          onThought: (thought) =>
+          onThought: (thought) => {
+            // Model chain-of-thought goes beside the spinner — never the Prep trail.
+            if ((thought.step || "").toLowerCase() === "model_reasoning") {
+              this.post({ type: "reasoning", text: thought.message });
+              return;
+            }
             this.post({
               type: "thought",
               step: thought.step,
               message: thought.message,
-            }),
+            });
+          },
           onTool: (name, detail) => this.post({ type: "tool", name, detail }),
           onPendingEdit: (edit) =>
             this.post({
@@ -268,7 +277,12 @@ class BlossomChatSession {
             });
             this.post({ type: "assistantDone", text: finalText });
           },
-          onError: (message) => this.post({ type: "error", text: message }),
+          onError: (message) =>
+            this.post({
+              type: "error",
+              text: message,
+              question: this.lastAsk,
+            }),
         });
         break;
       }
@@ -401,11 +415,13 @@ class BlossomChatSession {
       gap: 8px;
       min-height: 18px;
       margin-top: 8px;
-      padding: 6px 2px 4px;
+      padding: 4px 2px;
       color: var(--muted);
       font-size: 0.85em;
       flex-shrink: 0;
       flex-wrap: nowrap;
+      border: none;
+      background: transparent;
     }
     .busy-row.on {
       display: flex;
@@ -413,7 +429,7 @@ class BlossomChatSession {
     .busy-reasoning-wrap {
       display: none;
       align-items: baseline;
-      gap: 6px;
+      gap: 0;
       flex: 1;
       min-width: 0;
       overflow: hidden;
@@ -422,12 +438,7 @@ class BlossomChatSession {
       display: flex;
     }
     .busy-reasoning-label {
-      flex-shrink: 0;
-      font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      font-size: 0.72rem;
-      color: var(--muted);
+      display: none;
     }
     .busy-reasoning {
       flex: 1;
@@ -436,7 +447,13 @@ class BlossomChatSession {
       text-overflow: ellipsis;
       white-space: nowrap;
       font-style: italic;
-      opacity: 0.9;
+      color: var(--muted);
+      opacity: 0.85;
+      animation: blossom-reason-fade 0.35s ease;
+    }
+    @keyframes blossom-reason-fade {
+      from { opacity: 0.2; }
+      to { opacity: 0.85; }
     }
     .spinner {
       width: 14px;
@@ -514,6 +531,57 @@ class BlossomChatSession {
     }
     .msg.system { color: var(--muted); border-style: dashed; font-size: 0.9em; }
     .msg.error { color: var(--danger); }
+    .error-card {
+      position: relative;
+      border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--danger) 8%, var(--card));
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .error-card-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .error-card-title {
+      font-weight: 650;
+      color: var(--danger);
+      font-size: 0.9em;
+    }
+    .error-card-retry {
+      flex-shrink: 0;
+      margin-left: auto;
+    }
+    .error-card-question {
+      font-size: 0.9em;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-word;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--fg) 6%, var(--card));
+      border: 1px solid var(--border);
+      color: var(--fg);
+    }
+    .error-card-question-label {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .error-card-detail {
+      color: var(--danger);
+      font-size: 0.85em;
+      opacity: 0.95;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     .reply-section, .code-box {
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -801,15 +869,129 @@ class BlossomChatSession {
     let reasoningLines = [];
     let reasoningLineIdx = 0;
     let reasoningTimer = null;
+    let reasoningPlaying = false;
+    let reasoningDoneTimer = null;
+    let lastAsk = '';
     let busy = false;
 
+    function sendText(text, opts) {
+      const ask = (text || '').trim();
+      if (!ask || busy) return;
+      const isRetry = opts && opts.retry;
+      lastAsk = ask;
+      if (!isRetry) {
+        append('user', ask);
+        input.value = '';
+      } else {
+        const note = document.createElement('div');
+        note.className = 'tool';
+        note.textContent = 'Retrying…';
+        messagesEl.appendChild(note);
+        pinBusyToBottom();
+      }
+      setBusy(true);
+      streamingEl = null;
+      vscode.postMessage({ type: 'chat', text: ask });
+    }
+
+    function showErrorCard(errorText, question) {
+      const ask = (question || lastAsk || '').trim();
+      const card = document.createElement('div');
+      card.className = 'error-card';
+
+      const top = document.createElement('div');
+      top.className = 'error-card-top';
+      const title = document.createElement('div');
+      title.className = 'error-card-title';
+      title.textContent = 'Request failed';
+      top.appendChild(title);
+
+      if (ask) {
+        const retry = document.createElement('button');
+        retry.className = 'primary error-card-retry';
+        retry.textContent = 'Retry';
+        retry.title = 'Send this question again';
+        retry.onclick = () => {
+          retry.disabled = true;
+          sendText(ask, { retry: true });
+        };
+        top.appendChild(retry);
+      }
+      card.appendChild(top);
+
+      if (ask) {
+        const qWrap = document.createElement('div');
+        const qLabel = document.createElement('div');
+        qLabel.className = 'error-card-question-label';
+        qLabel.textContent = 'Question';
+        const qBody = document.createElement('div');
+        qBody.className = 'error-card-question';
+        qBody.textContent = ask;
+        qWrap.appendChild(qLabel);
+        qWrap.appendChild(qBody);
+        card.appendChild(qWrap);
+      }
+
+      const detail = document.createElement('div');
+      detail.className = 'error-card-detail';
+      detail.textContent = errorText || 'Unknown error';
+      card.appendChild(detail);
+
+      messagesEl.appendChild(card);
+      pinBusyToBottom();
+    }
+
+    function cleanReasoningText(text) {
+      return String(text || '')
+        .replace(/^(?:thought\\s+)?step\\s*=\\s*model_reasoning\\s*/i, '')
+        .replace(/^model_reasoning\\s*/i, '')
+        .trim();
+    }
+
+    /** Break reasoning into one-sentence chunks for the spinner ticker. */
     function splitReasoningLines(text) {
-      const raw = (text || '').trim();
+      const raw = cleanReasoningText(text);
       if (!raw) return [];
-      const byNewline = raw.split(/\\r?\\n/).map((l) => l.trim()).filter(Boolean);
-      if (byNewline.length > 1) return byNewline;
-      const sentences = raw.split(/(?<=[.!?])\\s+/).map((s) => s.trim()).filter(Boolean);
-      return sentences.length > 1 ? sentences : [raw];
+      const chunks = [];
+      const pushSentences = (block) => {
+        const b = (block || '').trim();
+        if (!b) return;
+        const re = /[^.!?]+(?:[.!?]+["']?|\\s*$)/g;
+        let m;
+        let matched = false;
+        while ((m = re.exec(b))) {
+          const s = m[0].replace(/\\s+/g, ' ').trim();
+          if (s) {
+            chunks.push(s);
+            matched = true;
+          }
+        }
+        if (!matched) chunks.push(b.replace(/\\s+/g, ' ').trim());
+      };
+      const paragraphs = raw.split(/\\r?\\n+/).map((l) => l.trim()).filter(Boolean);
+      if (paragraphs.length > 1) {
+        for (const p of paragraphs) pushSentences(p);
+      } else {
+        pushSentences(raw);
+      }
+      const out = [];
+      for (const s of chunks) {
+        if (!s) continue;
+        if (out.length && s.length < 12 && !/[.!?]$/.test(s)) {
+          out[out.length - 1] = out[out.length - 1] + ' ' + s;
+        } else {
+          out.push(s);
+        }
+      }
+      return out.length > 0 ? out : [raw.replace(/\\s+/g, ' ').trim()];
+    }
+
+    function ensureBusyRowVisible() {
+      const row = document.getElementById('busyRow');
+      if (!row) return;
+      row.classList.add('on');
+      row.setAttribute('aria-hidden', 'false');
+      pinBusyToBottom();
     }
 
     function showReasoningLine() {
@@ -820,22 +1002,118 @@ class BlossomChatSession {
       if (reasoningLines.length === 0) {
         wrap.classList.remove('on');
         el.textContent = '';
+        el.removeAttribute('title');
         if (label) label.style.display = '';
         return;
       }
+      ensureBusyRowVisible();
       wrap.classList.add('on');
       if (label) label.style.display = 'none';
       const idx = Math.min(reasoningLineIdx, reasoningLines.length - 1);
+      // retrigger fade animation
+      el.style.animation = 'none';
+      void el.offsetWidth;
+      el.style.animation = '';
       el.textContent = reasoningLines[idx];
+      el.title = reasoningLines[idx];
+    }
+
+    function finishReasoningTicker() {
+      stopReasoningTicker();
+      if (reasoningDoneTimer) {
+        clearTimeout(reasoningDoneTimer);
+        reasoningDoneTimer = null;
+      }
+      reasoningPlaying = false;
+      const wrap = document.getElementById('busyReasoningWrap');
+      const el = document.getElementById('busyReasoning');
+      const label = document.getElementById('busyLabel');
+      const row = document.getElementById('busyRow');
+      const spinner = document.getElementById('busySpinner');
+      if (wrap) wrap.classList.remove('on');
+      if (el) {
+        el.textContent = '';
+        el.removeAttribute('title');
+      }
+      if (label) {
+        label.style.display = '';
+        label.textContent = 'Working…';
+      }
+      if (spinner) spinner.style.display = '';
+      reasoningLines = [];
+      reasoningLineIdx = 0;
+      if (row && !busy) {
+        row.classList.remove('on');
+        row.setAttribute('aria-hidden', 'true');
+      }
+    }
+
+    function completeReasoningTicker() {
+      // Turn finished — don't drain remaining sentences; flash Done then hide.
+      stopReasoningTicker();
+      if (reasoningDoneTimer) {
+        clearTimeout(reasoningDoneTimer);
+        reasoningDoneTimer = null;
+      }
+      const wrap = document.getElementById('busyReasoningWrap');
+      const el = document.getElementById('busyReasoning');
+      const label = document.getElementById('busyLabel');
+      const row = document.getElementById('busyRow');
+      const spinner = document.getElementById('busySpinner');
+      const hadReasoning = reasoningPlaying || reasoningLines.length > 0;
+      reasoningPlaying = false;
+      reasoningLines = [];
+      reasoningLineIdx = 0;
+      if (!hadReasoning) {
+        if (row && !busy) {
+          row.classList.remove('on');
+          row.setAttribute('aria-hidden', 'true');
+        }
+        return;
+      }
+      if (row) {
+        row.classList.add('on');
+        row.setAttribute('aria-hidden', 'false');
+      }
+      if (spinner) spinner.style.display = 'none';
+      if (label) label.style.display = 'none';
+      if (wrap && el) {
+        wrap.classList.add('on');
+        el.style.animation = 'none';
+        void el.offsetWidth;
+        el.style.animation = '';
+        el.textContent = 'Done';
+        el.title = 'Done';
+        el.style.fontStyle = 'normal';
+        el.style.opacity = '0.75';
+      }
+      pinBusyToBottom();
+      reasoningDoneTimer = setTimeout(() => {
+        reasoningDoneTimer = null;
+        if (el) {
+          el.style.fontStyle = '';
+          el.style.opacity = '';
+        }
+        finishReasoningTicker();
+      }, 900);
     }
 
     function startReasoningTicker() {
       if (reasoningTimer) return;
+      if (!busy) return; // don't keep rotating after the turn finished
+      reasoningPlaying = true;
       reasoningTimer = setInterval(() => {
+        if (!busy) {
+          completeReasoningTicker();
+          return;
+        }
         if (reasoningLineIdx < reasoningLines.length - 1) {
           reasoningLineIdx += 1;
           showReasoningLine();
+          return;
         }
+        // On last sentence while still busy — hold it; Done comes when turn ends.
+        stopReasoningTicker();
       }, 5000);
     }
 
@@ -848,20 +1126,35 @@ class BlossomChatSession {
 
     function resetReasoningTicker() {
       stopReasoningTicker();
+      if (reasoningDoneTimer) {
+        clearTimeout(reasoningDoneTimer);
+        reasoningDoneTimer = null;
+      }
+      reasoningPlaying = false;
       reasoningLines = [];
       reasoningLineIdx = 0;
       const wrap = document.getElementById('busyReasoningWrap');
       const el = document.getElementById('busyReasoning');
       const label = document.getElementById('busyLabel');
+      const spinner = document.getElementById('busySpinner');
       if (wrap) wrap.classList.remove('on');
-      if (el) el.textContent = '';
-      if (label) label.style.display = '';
+      if (el) {
+        el.textContent = '';
+        el.removeAttribute('title');
+        el.style.fontStyle = '';
+        el.style.opacity = '';
+      }
+      if (label) {
+        label.style.display = '';
+        label.textContent = 'Working…';
+      }
+      if (spinner) spinner.style.display = '';
     }
 
     function setReasoningTicker(text) {
+      if (!busy) return; // ignore late reasoning after the turn is done
       const lines = splitReasoningLines(text);
       if (lines.length === 0) {
-        resetReasoningTicker();
         return;
       }
       const prevLen = reasoningLines.length;
@@ -870,9 +1163,12 @@ class BlossomChatSession {
         reasoningLineIdx = 0;
         showReasoningLine();
         startReasoningTicker();
-      } else if (reasoningLineIdx >= reasoningLines.length) {
-        reasoningLineIdx = reasoningLines.length - 1;
+      } else {
+        if (reasoningLineIdx >= reasoningLines.length) {
+          reasoningLineIdx = reasoningLines.length - 1;
+        }
         showReasoningLine();
+        startReasoningTicker();
       }
     }
 
@@ -891,7 +1187,12 @@ class BlossomChatSession {
     }
 
     function addThought(step, message, local) {
-      if (step === 'model_reasoning') {
+      const stepKey = String(step || '').toLowerCase();
+      // Never dump model reasoning into Prep — spinner ticker only.
+      if (
+        stepKey === 'model_reasoning' ||
+        /^(?:thought\\s+)?step\\s*=\\s*model_reasoning\\b/i.test(String(message || ''))
+      ) {
         setReasoningTicker(message);
         pinBusyToBottom();
         return;
@@ -1057,7 +1358,7 @@ class BlossomChatSession {
       if (!b || b.type !== 'code') return false;
       const c = (b.content || '').trim();
       if (/^(delete|remove)$/i.test(b.lang || '')) return true;
-      if (/^(DELETE|REMOVE)(?:\\s+FILE)?$/i.test(c)) return true;
+      if (/^(DELETE|REMOVE)(?:[_\s]+FILE)?$/i.test(c)) return true;
       // Empty path-labeled fence = delete marker
       return !c && Boolean(b.path);
     }
@@ -1202,24 +1503,23 @@ class BlossomChatSession {
       document.getElementById('btnSend').disabled = v;
       const row = document.getElementById('busyRow');
       if (row) {
-        if (v) row.classList.add('on');
-        else {
+        if (v) {
+          row.classList.add('on');
+          row.setAttribute('aria-hidden', 'false');
+        } else if (reasoningPlaying || reasoningLines.length > 0) {
+          // Skip remaining flavor sentences — flash Done then hide.
+          completeReasoningTicker();
+        } else {
           row.classList.remove('on');
+          row.setAttribute('aria-hidden', 'true');
           resetReasoningTicker();
         }
-        row.setAttribute('aria-hidden', v ? 'false' : 'true');
       }
       pinBusyToBottom();
     }
 
     function send() {
-      const text = input.value.trim();
-      if (!text || busy) return;
-      append('user', text);
-      input.value = '';
-      setBusy(true);
-      streamingEl = null;
-      vscode.postMessage({ type: 'chat', text });
+      sendText(input.value, { retry: false });
     }
 
     document.getElementById('btnSend').addEventListener('click', send);
@@ -1275,11 +1575,17 @@ class BlossomChatSession {
           resetReasoningTicker();
           streamingEl = null;
           break;
+        case 'reasoning':
+          setReasoningTicker(msg.text || '');
+          pinBusyToBottom();
+          break;
         case 'thought':
           addThought(msg.step || '', msg.message || '', false);
           break;
         case 'token':
-          resetReasoningTicker();
+          // Do NOT clear the reasoning ticker here — ChatRouter often emits
+          // model_reasoning immediately before answer tokens, so wiping on
+          // first token made the ticker invisible. Keep sentences rotating.
           if (thoughtsEl && thoughtsEl.open) {
             // collapse trail once answer starts flowing
             thoughtsEl.open = false;
@@ -1358,7 +1664,7 @@ class BlossomChatSession {
             if (sum) sum.textContent = 'Failed';
           }
           streamingEl = null;
-          append('error', 'Error — ' + (msg.text || 'Unknown error'));
+          showErrorCard(msg.text || 'Unknown error', msg.question || lastAsk);
           setBusy(false);
           thoughtsEl = null;
           thoughtsList = null;
@@ -1418,6 +1724,7 @@ class BlossomChatSession {
           messagesEl.innerHTML = '';
           thoughtsEl = null;
           thoughtsList = null;
+          lastAsk = '';
           resetReasoningTicker();
           streamingEl = null;
           // Recreate busy row after clear (innerHTML wiped it)

@@ -1,3 +1,4 @@
+import * as vscode from "vscode";
 import { proposeFileDelete, proposeFileEdit, rejectPendingEdit, type PendingEdit } from "./tools";
 
 const FENCE_RE = /```([^\n`]*)\n([\s\S]*?)```/g;
@@ -45,7 +46,11 @@ const LANG_TO_EXT: Record<string, string> = {
 const FILE_NAME_RE =
   /([a-zA-Z0-9_.\-]+(?:\/[a-zA-Z0-9_.\-]+)*\.(?:html?|css|js|jsx|ts|tsx|mjs|cjs|json|md|py|go|rs|java|kt|cs|php|rb|vue|svelte|sql|yml|yaml|toml|xml|svg|sh|ps1))/i;
 
-const DELETE_BODY_RE = /^(?:DELETE|REMOVE)(?:\s+FILE)?\s*$/i;
+const DELETE_BODY_RE = /^(?:DELETE|REMOVE)(?:[_\s]+FILE)?\s*$/i;
+
+function isDeleteMarker(content: string): boolean {
+  return DELETE_BODY_RE.test((content || "").trim());
+}
 
 interface ParsedFence {
   info: string;
@@ -65,7 +70,7 @@ function parseFences(text: string): ParsedFence[] {
     const headingPath = extractHeadingPathBeforeFence(before);
     const { hintPath, hintExt } = extractPathHints(info, content, headingPath);
     const infoIsDelete = /\b(?:delete|remove)(?:_file)?\b/i.test(info);
-    const bodyIsDelete = DELETE_BODY_RE.test(content.trim());
+    const bodyIsDelete = isDeleteMarker(content);
     const isDelete = infoIsDelete || bodyIsDelete;
 
     // Skip tiny fences unless they are explicit deletes (empty / DELETE body).
@@ -117,6 +122,199 @@ function extractDeletePathsFromText(text: string): string[] {
   }
 
   return paths;
+}
+
+/** Paths the user explicitly asked to delete, e.g. "Delete end.html and update index". */
+export function extractExplicitDeletePathsFromUser(userText: string): string[] {
+  // Sync helper: only names that already include an extension.
+  return extractDeleteHintsFromUser(userText).filter((h) => /\.\w{1,8}$/.test(h));
+}
+
+const DELETE_HINT_STOPWORDS = new Set([
+  "file",
+  "files",
+  "the",
+  "a",
+  "an",
+  "this",
+  "that",
+  "them",
+  "it",
+  "unused",
+  "orphan",
+  "orphans",
+  "all",
+  "any",
+  "some",
+  "my",
+  "our",
+  "please",
+  "again",
+  "now",
+  "here",
+]);
+
+/**
+ * Name hints from user delete phrasing — with or without extension.
+ * Examples: "delete marks", "delete end.html", "you didn't delete marks".
+ */
+export function extractDeleteHintsFromUser(userText: string): string[] {
+  const hints: string[] = [];
+  const add = (raw: string | undefined): void => {
+    if (!raw) {
+      return;
+    }
+    let cleaned = raw
+      .replace(/^[`"'<]+|[`"'>\s.,;:!]+$/g, "")
+      .replace(/\\/g, "/")
+      .trim();
+    // Strip trailing words accidentally captured ("marks please")
+    cleaned = cleaned.split(/\s+/)[0] ?? cleaned;
+    if (!cleaned || cleaned.length < 2 || cleaned.length > 80) {
+      return;
+    }
+    if (DELETE_HINT_STOPWORDS.has(cleaned.toLowerCase())) {
+      return;
+    }
+    // Reject pure language tags
+    if (LANG_TO_EXT[cleaned.toLowerCase()] !== undefined) {
+      return;
+    }
+    if (!hints.some((h) => h.toLowerCase() === cleaned.toLowerCase())) {
+      hints.push(cleaned);
+    }
+  };
+
+  const text = userText || "";
+  for (const m of text.matchAll(
+    /\b(?:delete|remove|deleting|removing)\s+(?:the\s+)?(?:file\s+)?[`"']?([a-zA-Z][\w.\-/]*)/gi
+  )) {
+    add(m[1]);
+  }
+  for (const m of text.matchAll(
+    /\b(?:didn'?t|did\s+not)\s+delete\s+[`"']?([a-zA-Z][\w.\-/]*)/gi
+  )) {
+    add(m[1]);
+  }
+  for (const m of text.matchAll(
+    /\btry\s+(?:to\s+)?(?:delete|deleting|remove|removing)\s+[`"']?([a-zA-Z][\w.\-/]*)/gi
+  )) {
+    add(m[1]);
+  }
+  return hints;
+}
+
+function basenameNoExt(p: string): string {
+  const base = basename(p);
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(0, dot) : base;
+}
+
+/**
+ * Resolve user delete hints against real workspace files.
+ * Bare names like "marks" → marks.html when unique on disk.
+ */
+export async function resolveUserDeleteTargets(
+  userText: string,
+  preferNearPaths: string[] = []
+): Promise<{
+  resolved: string[];
+  missing: string[];
+  ambiguous: Array<{ hint: string; candidates: string[] }>;
+}> {
+  const hints = extractDeleteHintsFromUser(userText);
+  const resolved: string[] = [];
+  const missing: string[] = [];
+  const ambiguous: Array<{ hint: string; candidates: string[] }> = [];
+
+  if (hints.length === 0) {
+    return { resolved, missing, ambiguous };
+  }
+
+  const preferDirs = new Set(
+    preferNearPaths.map((p) => {
+      const n = p.replace(/\\/g, "/");
+      const i = n.lastIndexOf("/");
+      return i >= 0 ? n.slice(0, i) : ".";
+    })
+  );
+
+  for (const hint of hints) {
+    const normHint = hint.replace(/\\/g, "/");
+    const hasExt = /\.\w{1,8}$/.test(normHint);
+    const needle = hasExt ? basename(normHint) : basenameNoExt(normHint);
+    const glob = hasExt ? `**/${basename(normHint)}` : `**/${needle}.*`;
+
+    let uris: vscode.Uri[] = [];
+    try {
+      uris = await vscode.workspace.findFiles(
+        glob,
+        "**/{node_modules,.git,dist,out,build}/**",
+        40
+      );
+    } catch {
+      uris = [];
+    }
+
+    const rels = uris
+      .map((u) => vscode.workspace.asRelativePath(u, false).replace(/\\/g, "/"))
+      .filter(Boolean);
+
+    let matches = rels.filter((rel) => {
+      const b = basename(rel);
+      if (hasExt) {
+        return b.toLowerCase() === basename(normHint).toLowerCase();
+      }
+      return basenameNoExt(rel).toLowerCase() === needle.toLowerCase();
+    });
+
+    // Prefer files near attached editor paths when multiple matches
+    if (matches.length > 1 && preferDirs.size > 0) {
+      const near = matches.filter((rel) => {
+        const i = rel.lastIndexOf("/");
+        const dir = i >= 0 ? rel.slice(0, i) : ".";
+        return preferDirs.has(dir);
+      });
+      if (near.length === 1) {
+        matches = near;
+      } else if (near.length > 1) {
+        matches = near;
+      }
+    }
+
+    if (matches.length === 1) {
+      if (!resolved.some((r) => pathsMatch(r, matches[0]))) {
+        resolved.push(matches[0]);
+      }
+    } else if (matches.length === 0) {
+      missing.push(hint);
+    } else {
+      ambiguous.push({ hint, candidates: matches.slice(0, 8) });
+    }
+  }
+
+  return { resolved, missing, ambiguous };
+}
+
+export function deletePathAllowed(
+  candidate: string,
+  allowed: string[]
+): boolean {
+  if (allowed.length === 0) {
+    return true;
+  }
+  const cand = candidate.replace(/\\/g, "/");
+  const candBase = basename(cand).toLowerCase();
+  const candStem = basenameNoExt(cand).toLowerCase();
+  return allowed.some((a) => {
+    const norm = a.replace(/\\/g, "/");
+    if (pathsMatch(norm, cand)) {
+      return true;
+    }
+    const base = basename(norm).toLowerCase();
+    const stem = basenameNoExt(norm).toLowerCase();
+    return base === candBase || stem === candStem;
+  });
 }
 
 /**
@@ -294,22 +492,34 @@ function scoreFenceForPath(fence: ParsedFence, path: string): number {
  * - attached files
  * - new files labeled via path=, bold headings (**contacts.html**), or comments
  * - deletes via DELETE path=… lines or ```delete path=… fences
+ * - user-requested deletes (preDeletePaths), optionally allowlisted so the model
+ *   cannot delete a different file than the one the user named
  */
 export async function proposeEditsFromAssistantReply(
   assistantText: string,
   attachedPaths: string[],
   onPendingEdit: (
     edit: PendingEdit
-  ) => boolean | void | Promise<boolean | void>
+  ) => boolean | void | Promise<boolean | void>,
+  preDeletePaths: string[] = [],
+  opts?: {
+    /** When true and preDeletePaths is non-empty, ignore model deletes outside that set. */
+    lockDeletesToUserTargets?: boolean;
+    onSkippedDelete?: (path: string, reason: string) => void;
+  }
 ): Promise<{ count: number; edits: PendingEdit[] }> {
-  if (!assistantText) {
+  if (!assistantText && preDeletePaths.length === 0) {
     return { count: 0, edits: [] };
   }
 
-  const fences = parseFences(assistantText);
+  const fences = parseFences(assistantText || "");
   const edits: PendingEdit[] = [];
   const usedFences = new Set<number>();
+  // Only paths we have successfully proposed — do NOT seed with preDeletePaths
+  // or user-requested deletes get skipped as "already done".
   const deletedPaths: string[] = [];
+  const lockDeletes =
+    Boolean(opts?.lockDeletesToUserTargets) && preDeletePaths.length > 0;
 
   const pushEdit = async (edit: PendingEdit): Promise<void> => {
     const accepted = await onPendingEdit(edit);
@@ -320,7 +530,10 @@ export async function proposeEditsFromAssistantReply(
     edits.push(edit);
   };
 
-  const proposeDelete = async (path: string): Promise<void> => {
+  const proposeDelete = async (
+    path: string,
+    source: "user" | "model"
+  ): Promise<void> => {
     const norm = path.replace(/\\/g, "/");
     if (deletedPaths.some((p) => pathsMatch(p, norm))) {
       return;
@@ -328,24 +541,43 @@ export async function proposeEditsFromAssistantReply(
     if (edits.some((e) => pathsMatch(e.relativePath, norm))) {
       return;
     }
+    if (lockDeletes && source === "model" && !deletePathAllowed(norm, preDeletePaths)) {
+      opts?.onSkippedDelete?.(
+        norm,
+        `user asked to delete ${preDeletePaths.join(", ")}, not this path`
+      );
+      return;
+    }
+    if (lockDeletes && source === "user" && !deletePathAllowed(norm, preDeletePaths)) {
+      // Shouldn't happen for resolved user paths; keep safe.
+      opts?.onSkippedDelete?.(norm, "not in resolved user delete targets");
+      return;
+    }
     const result = await proposeFileDelete(norm);
     if (result.ok && result.pendingEdit) {
       deletedPaths.push(norm);
       await pushEdit(result.pendingEdit);
+    } else if (!result.ok) {
+      opts?.onSkippedDelete?.(norm, result.content || "delete failed");
     }
   };
 
-  // 0) Explicit DELETE lines + delete fences (before writes)
-  for (const p of extractDeletePathsFromText(assistantText)) {
-    await proposeDelete(p);
+  // 0) User-requested deletes first (e.g. "delete marks" → marks.html)
+  for (const p of preDeletePaths) {
+    await proposeDelete(p, "user");
+  }
+  for (const p of extractDeletePathsFromText(assistantText || "")) {
+    await proposeDelete(p, "model");
   }
   for (let i = 0; i < fences.length; i++) {
     const fence = fences[i];
-    if (!fence.isDelete || !fence.hintPath) {
+    if (!fence.hintPath) {
       continue;
     }
-    usedFences.add(i);
-    await proposeDelete(fence.hintPath);
+    if (fence.isDelete || isDeleteMarker(fence.content)) {
+      usedFences.add(i);
+      await proposeDelete(fence.hintPath, "model");
+    }
   }
 
   if (fences.length === 0 && edits.length > 0) {
@@ -376,7 +608,10 @@ export async function proposeEditsFromAssistantReply(
   // 1) Assign every path-labeled write fence (creates contacts.html etc.)
   for (let i = 0; i < fences.length; i++) {
     const fence = fences[i];
-    if (!fence.hintPath || usedFences.has(i) || fence.isDelete) {
+    if (!fence.hintPath || usedFences.has(i)) {
+      continue;
+    }
+    if (fence.isDelete || isDeleteMarker(fence.content)) {
       continue;
     }
     const path = fence.hintPath.replace(/\\/g, "/");
@@ -423,6 +658,12 @@ export async function proposeEditsFromAssistantReply(
     }
 
     if (bestIdx < 0) {
+      continue;
+    }
+    const chosen = fences[bestIdx];
+    if (chosen.hintPath && isDeleteMarker(chosen.content)) {
+      usedFences.add(bestIdx);
+      await proposeDelete(chosen.hintPath, "model");
       continue;
     }
     // With multiple remaining unlabeled fences, require a real signal
