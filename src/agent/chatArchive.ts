@@ -11,11 +11,32 @@ const MAX_ARCHIVES = 80;
 /** Soft cap per archived chat file (chars of JSON-ish content). */
 const MAX_ARCHIVE_CHARS = 400_000;
 const MAX_MESSAGE_CONTENT = 12_000;
+/** Per-side cap for archived edit payloads (old/new / replace preview). */
+const MAX_EDIT_CONTENT = 40_000;
+const MAX_ARCHIVED_EDITS = 40;
 const LIST_PREVIEW_CHARS = 120;
 
 export interface ChatArchiveMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+}
+
+/** Applied (or shown) file edit card — restored into the chat UI with History. */
+export interface ChatArchiveEdit {
+  id: string;
+  relativePath: string;
+  kind?: "write" | "delete";
+  source?: "write_file" | "search_replace" | "fence" | "delete";
+  oldContent: string;
+  newContent: string;
+  replacePreview?: {
+    oldString: string;
+    newString: string;
+    replaceAll?: boolean;
+    matchCount?: number;
+  };
+  status: "applied" | "rejected" | "pending";
+  auto?: boolean;
 }
 
 export interface ChatArchive {
@@ -25,6 +46,8 @@ export interface ChatArchive {
   updatedAt: string;
   historySummary?: string;
   messages: ChatArchiveMessage[];
+  /** Diff cards from the session (missing on older archives). */
+  edits?: ChatArchiveEdit[];
 }
 
 export interface ChatArchiveIndexEntry {
@@ -177,6 +200,54 @@ export function uiMessagesFromArchive(
   return out;
 }
 
+function trimEditSide(content: string, max = MAX_EDIT_CONTENT): string {
+  const t = (content || "").replace(/\r\n/g, "\n");
+  if (t.length <= max) {
+    return t;
+  }
+  return `${t.slice(0, max - 1)}…`;
+}
+
+/** Normalize edit cards for durable storage (cap size / count). */
+export function editsForArchive(edits: ChatArchiveEdit[]): ChatArchiveEdit[] {
+  const out: ChatArchiveEdit[] = [];
+  for (const e of edits.slice(-MAX_ARCHIVED_EDITS)) {
+    if (!e?.id || !e.relativePath?.trim()) {
+      continue;
+    }
+    const status =
+      e.status === "rejected" || e.status === "pending" ? e.status : "applied";
+    const entry: ChatArchiveEdit = {
+      id: String(e.id).slice(0, 80),
+      relativePath: e.relativePath.replace(/\\/g, "/").trim(),
+      kind: e.kind === "delete" ? "delete" : "write",
+      source: e.source,
+      oldContent: trimEditSide(e.oldContent || ""),
+      newContent: trimEditSide(e.newContent || ""),
+      status,
+      auto: !!e.auto,
+    };
+    if (e.replacePreview) {
+      entry.replacePreview = {
+        oldString: trimEditSide(e.replacePreview.oldString || "", 12_000),
+        newString: trimEditSide(e.replacePreview.newString || "", 12_000),
+        replaceAll: !!e.replacePreview.replaceAll,
+        matchCount: e.replacePreview.matchCount ?? 1,
+      };
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
+/** Edits suitable for replaying into the chat UI (and Compare cache). */
+export function uiEditsFromArchive(archive: ChatArchive): ChatArchiveEdit[] {
+  if (!Array.isArray(archive.edits) || archive.edits.length === 0) {
+    return [];
+  }
+  return editsForArchive(archive.edits);
+}
+
 /** History to restore into the orchestrator (user/assistant/system; drop tool spam). */
 export function historyForRestore(archive: ChatArchive): {
   history: OllamaMessage[];
@@ -270,6 +341,7 @@ export async function saveChatArchive(opts: {
   history: OllamaMessage[];
   historySummary?: string;
   createdAt?: string;
+  edits?: ChatArchiveEdit[];
 }): Promise<ChatArchive | undefined> {
   const dir = await ensureArchiveDir();
   if (!dir) {
@@ -283,14 +355,21 @@ export async function saveChatArchive(opts: {
 
   const now = new Date().toISOString();
   let createdAt = opts.createdAt || now;
+  let priorEdits: ChatArchiveEdit[] | undefined;
   try {
     const existing = await loadChatArchive(opts.id);
     if (existing?.createdAt) {
       createdAt = existing.createdAt;
     }
+    if (existing?.edits?.length && !opts.edits?.length) {
+      // Keep previously saved edit cards if this save omitted them.
+      priorEdits = existing.edits;
+    }
   } catch {
     // new archive
   }
+
+  const edits = editsForArchive(opts.edits?.length ? opts.edits : priorEdits || []);
 
   const archive: ChatArchive = {
     id: opts.id,
@@ -299,6 +378,7 @@ export async function saveChatArchive(opts: {
     updatedAt: now,
     historySummary: opts.historySummary?.trim() || undefined,
     messages,
+    ...(edits.length ? { edits } : {}),
   };
 
   let payload = JSON.stringify(archive, null, 2);

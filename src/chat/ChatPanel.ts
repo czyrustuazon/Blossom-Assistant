@@ -6,7 +6,11 @@ import {
   openPendingEditDiff,
 } from "../agent/diffDocuments";
 import { diffFileContents } from "../agent/lineDiff";
-import { getPendingEdit, type PendingEdit } from "../agent/tools";
+import {
+  getPendingEdit,
+  restorePendingEdit,
+  type PendingEdit,
+} from "../agent/tools";
 import { AgentOrchestrator, type OrchestratorEvents } from "../agent/orchestrator";
 import { checkHealth } from "../ollama/client";
 import { sendCorrectnessFeedback } from "../feedback/client";
@@ -29,8 +33,10 @@ import {
   loadChatArchive,
   newChatArchiveId,
   saveChatArchive,
+  uiEditsFromArchive,
   uiMessagesFromArchive,
   type ChatArchive,
+  type ChatArchiveEdit,
 } from "../agent/chatArchive";
 
 /**
@@ -306,6 +312,8 @@ class BlossomChatSession {
   private pendingRestore?: ChatArchive;
   /** Keep edit payloads for Compare after auto-apply clears pendingEdits. */
   private readonly editDiffCache = new Map<string, PendingEdit>();
+  /** Session edit cards persisted into History (status + payloads). */
+  private readonly sessionEdits = new Map<string, ChatArchiveEdit>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -324,6 +332,7 @@ class BlossomChatSession {
       this.topicSummary = initialArchive.title;
       const restored = historyForRestore(initialArchive);
       this.orchestrator.restoreArchive(restored);
+      this.hydrateEditsFromArchive(initialArchive);
       this.pendingRestore = initialArchive;
     }
 
@@ -375,12 +384,61 @@ class BlossomChatSession {
       history: snap.history,
       historySummary: snap.historySummary,
       createdAt: this.archiveCreatedAt,
+      edits: [...this.sessionEdits.values()],
     });
   }
 
   private beginFreshArchive(): void {
     this.archiveId = newChatArchiveId();
     this.archiveCreatedAt = new Date().toISOString();
+    this.editDiffCache.clear();
+    this.sessionEdits.clear();
+  }
+
+  private hydrateEditsFromArchive(archive: ChatArchive): void {
+    this.editDiffCache.clear();
+    this.sessionEdits.clear();
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    for (const e of uiEditsFromArchive(archive)) {
+      this.sessionEdits.set(e.id, e);
+      const abs = root
+        ? path.join(root, e.relativePath.replace(/\//g, path.sep))
+        : e.relativePath;
+      const pending: PendingEdit = {
+        id: e.id,
+        relativePath: e.relativePath,
+        absolutePath: abs,
+        oldContent: e.oldContent || "",
+        newContent: e.newContent || "",
+        kind: e.kind === "delete" ? "delete" : "write",
+        source: e.source,
+        replacePreview: e.replacePreview,
+      };
+      this.editDiffCache.set(e.id, pending);
+      // Pending cards need the live map so Apply still works after History restore.
+      if (e.status === "pending") {
+        restorePendingEdit(pending);
+      }
+    }
+  }
+
+  private rememberSessionEdit(
+    edit: PendingEdit,
+    status: ChatArchiveEdit["status"],
+    auto?: boolean
+  ): void {
+    const prev = this.sessionEdits.get(edit.id);
+    this.sessionEdits.set(edit.id, {
+      id: edit.id,
+      relativePath: edit.relativePath.replace(/\\/g, "/"),
+      kind: edit.kind === "delete" ? "delete" : "write",
+      source: edit.source,
+      oldContent: edit.oldContent || "",
+      newContent: edit.newContent || "",
+      replacePreview: edit.replacePreview,
+      status,
+      auto: auto ?? prev?.auto,
+    });
   }
 
   private postRestoreIfNeeded(): void {
@@ -390,10 +448,55 @@ class BlossomChatSession {
     }
     this.pendingRestore = undefined;
     const messages = uiMessagesFromArchive(archive);
+    const edits = uiEditsFromArchive(archive);
     this.post({
       type: "restoreHistory",
       title: archive.title,
       messages,
+      edits: edits.map((e) => {
+        const isDelete = e.kind === "delete";
+        const isNew = !isDelete && !e.oldContent;
+        const diff = isDelete
+          ? diffFileContents(e.oldContent || "", "")
+          : diffFileContents(e.oldContent || "", e.newContent || "");
+        const preview = e.replacePreview;
+        return {
+          id: e.id,
+          path: e.relativePath,
+          isNew,
+          isDelete,
+          source:
+            e.source ||
+            (isDelete ? "delete" : isNew ? "write_file" : "write_file"),
+          status: e.status,
+          auto: !!e.auto,
+          replacePreview: preview
+            ? {
+                oldString: preview.oldString,
+                newString: preview.newString,
+                replaceAll: !!preview.replaceAll,
+                matchCount: preview.matchCount ?? 1,
+              }
+            : undefined,
+          diff: {
+            additions: diff.additions,
+            deletions: diff.deletions,
+            truncated: diff.truncated,
+            hunks: diff.hunks.map((h) => ({
+              header: h.header,
+              oldStart: h.oldStart,
+              newStart: h.newStart,
+              lines: h.lines.map((l) => ({
+                kind: l.kind,
+                text: l.text,
+                oldLine: l.oldLine,
+                newLine: l.newLine,
+                segments: l.segments,
+              })),
+            })),
+          },
+        };
+      }),
     });
   }
 
@@ -580,6 +683,7 @@ class BlossomChatSession {
           : diffFileContents(edit.oldContent || "", edit.newContent || "");
         const preview = edit.replacePreview;
         this.editDiffCache.set(edit.id, { ...edit });
+        this.rememberSessionEdit(edit, "pending", !!meta?.autoApply);
         this.post({
           type: "pendingEdit",
           id: edit.id,
@@ -628,6 +732,15 @@ class BlossomChatSession {
       onEditNeedsApply: (id) => this.post({ type: "editNeedsApply", id }),
       onEditApplied: (id, path) => {
         this.orchestrator.noteFileApplied(path, true);
+        const cached = this.editDiffCache.get(id) || getPendingEdit(id);
+        if (cached) {
+          this.rememberSessionEdit(cached, "applied", true);
+        } else {
+          const prev = this.sessionEdits.get(id);
+          if (prev) {
+            this.sessionEdits.set(id, { ...prev, status: "applied", auto: true });
+          }
+        }
         this.post({ type: "editApplied", id, path, auto: true });
       },
       onCodingSummary: (summary) =>
@@ -866,10 +979,24 @@ class BlossomChatSession {
       case "applyEdit":
         if (msg.editId) {
           try {
-            const path = await this.orchestrator.applyEdit(msg.editId);
-            this.orchestrator.noteFileApplied(path, false);
-            this.post({ type: "editApplied", id: msg.editId, path });
-            void vscode.window.showInformationMessage(`Applied: ${path}`);
+            const cached =
+              getPendingEdit(msg.editId) || this.editDiffCache.get(msg.editId);
+            const appliedPath = await this.orchestrator.applyEdit(msg.editId);
+            this.orchestrator.noteFileApplied(appliedPath, false);
+            if (cached) {
+              this.rememberSessionEdit(cached, "applied", false);
+            } else {
+              const prev = this.sessionEdits.get(msg.editId);
+              if (prev) {
+                this.sessionEdits.set(msg.editId, {
+                  ...prev,
+                  status: "applied",
+                  auto: false,
+                });
+              }
+            }
+            this.post({ type: "editApplied", id: msg.editId, path: appliedPath });
+            void vscode.window.showInformationMessage(`Applied: ${appliedPath}`);
           } catch (err) {
             const m = err instanceof Error ? err.message : String(err);
             this.post({ type: "error", text: m });
@@ -897,7 +1024,20 @@ class BlossomChatSession {
         break;
       case "rejectEdit":
         if (msg.editId) {
+          const cached =
+            getPendingEdit(msg.editId) || this.editDiffCache.get(msg.editId);
           await this.orchestrator.rejectEdit(msg.editId);
+          if (cached) {
+            this.rememberSessionEdit(cached, "rejected", false);
+          } else {
+            const prev = this.sessionEdits.get(msg.editId);
+            if (prev) {
+              this.sessionEdits.set(msg.editId, {
+                ...prev,
+                status: "rejected",
+              });
+            }
+          }
           this.post({ type: "editRejected", id: msg.editId });
         }
         break;
@@ -1159,15 +1299,19 @@ class BlossomChatSession {
       overflow: auto;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 12px;
       padding: 4px 2px 12px;
     }
+    /* Do not flex-shrink cards — that crushed diff views into a 1-line strip. */
+    #messages > * {
+      flex-shrink: 0;
+    }
     .msg {
-      padding: 8px 10px;
+      padding: 10px 12px;
       border-radius: 8px;
       white-space: pre-wrap;
       word-break: break-word;
-      line-height: 1.4;
+      line-height: 1.45;
       border: 1px solid var(--border);
     }
     .msg.user { background: var(--user); }
@@ -1460,7 +1604,7 @@ class BlossomChatSession {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 10px;
+      padding: 10px 12px;
       border-bottom: 1px solid var(--border);
       background: color-mix(in srgb, var(--fg) 5%, var(--card));
     }
@@ -1509,11 +1653,11 @@ class BlossomChatSession {
     .diff-replace {
       border-bottom: 1px solid var(--border);
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 0.8em;
-      line-height: 1.45;
+      font-size: 0.88em;
+      line-height: 1.55;
     }
     .diff-replace-hd {
-      padding: 6px 10px 2px;
+      padding: 8px 12px 4px;
       font-size: 0.78em;
       font-weight: 650;
       letter-spacing: 0.02em;
@@ -1523,16 +1667,16 @@ class BlossomChatSession {
     .diff-replace-hd.del { color: #f85149; }
     .diff-replace-hd.add { color: #3fb950; }
     .diff-view {
-      max-height: 420px;
+      max-height: min(560px, 55vh);
       overflow: auto;
       margin: 0;
       background: transparent;
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 0.8em;
-      line-height: 1.45;
+      font-size: 0.88em;
+      line-height: 1.55;
     }
     .diff-hunk-hd {
-      padding: 4px 10px;
+      padding: 6px 12px;
       color: color-mix(in srgb, var(--fg) 45%, transparent);
       background: color-mix(in srgb, var(--fg) 4%, transparent);
       user-select: none;
@@ -1543,10 +1687,11 @@ class BlossomChatSession {
     }
     .diff-line {
       display: grid;
-      grid-template-columns: 44px 16px minmax(0, 1fr);
+      grid-template-columns: 48px 18px minmax(0, 1fr);
       white-space: pre-wrap;
       word-break: break-word;
-      min-height: 1.45em;
+      min-height: 1.55em;
+      padding: 1px 0;
     }
     .diff-line .ln {
       text-align: right;
@@ -1562,7 +1707,7 @@ class BlossomChatSession {
       font-weight: 600;
     }
     .diff-line .body {
-      padding-right: 10px;
+      padding-right: 12px;
       min-width: 0;
     }
     .diff-line.add { background: rgba(46, 160, 67, 0.18); }
@@ -1584,8 +1729,8 @@ class BlossomChatSession {
       color: var(--muted);
       font-style: italic;
     }
-    .edit .row { padding: 8px 10px 10px; }
-    .edit .cmd-card-status { padding: 6px 10px 10px; }
+    .edit .row { padding: 10px 12px 12px; }
+    .edit .cmd-card-status { padding: 8px 12px 12px; }
     .cmd-card {
       border-style: solid;
       border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
@@ -1629,26 +1774,28 @@ class BlossomChatSession {
       border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
       background: color-mix(in srgb, var(--accent) 10%, var(--card));
       margin-top: 4px;
+      padding: 10px 12px;
     }
     .summary-card .title {
       font-weight: 650;
-      margin-bottom: 6px;
+      margin-bottom: 8px;
     }
     .summary-card ul {
       margin: 0;
       padding-left: 1.2em;
     }
     .summary-card li {
-      margin: 3px 0;
-      line-height: 1.35;
+      margin: 4px 0;
+      line-height: 1.45;
     }
     .edit pre {
-      max-height: 160px;
+      max-height: 280px;
       overflow: auto;
-      margin: 6px 0;
+      margin: 8px 0;
       white-space: pre-wrap;
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 0.85em;
+      font-size: 0.88em;
+      line-height: 1.55;
     }
     .composer {
       display: flex;
@@ -2236,7 +2383,8 @@ class BlossomChatSession {
       return out;
     }
 
-    function parseReplyBlocks(text) {
+    function parseReplyBlocks(text, opts) {
+      const preserveFileFences = !!(opts && opts.preserveFileFences);
       const blocks = [];
       const re = /\`\`\`([^\\n\`]*)\\n([\\s\\S]*?)\`\`\`/g;
       let last = 0;
@@ -2264,8 +2412,14 @@ class BlossomChatSession {
           filePath = lang;
           lang = '';
         }
-        // Path-labeled full-file dumps become diff cards — show path, skip body.
-        if (filePath && /\\b(?:path|file)\\s*[=:]/i.test(info) && !/\\b(?:delete|remove)\\b/i.test(info)) {
+        // Live turns: path-labeled dumps become diff cards — show path, skip body.
+        // History restore without archived edits: keep the fence body so code is visible.
+        if (
+          !preserveFileFences &&
+          filePath &&
+          /\\b(?:path|file)\\s*[=:]/i.test(info) &&
+          !/\\b(?:delete|remove)\\b/i.test(info)
+        ) {
           blocks.push({ type: 'prose', body: '**Edit:** \`' + filePath + '\`' });
           last = m.index + m[0].length;
           continue;
@@ -2317,10 +2471,10 @@ class BlossomChatSession {
       parent.appendChild(box);
     }
 
-    function renderAssistant(el, text) {
+    function renderAssistant(el, text, opts) {
       el.classList.add('rich');
       el.textContent = '';
-      const blocks = parseReplyBlocks(text || '');
+      const blocks = parseReplyBlocks(text || '', opts);
       if (blocks.length === 0) {
         el.classList.remove('rich');
         el.textContent = text || '';
@@ -2534,8 +2688,8 @@ class BlossomChatSession {
       messagesEl.appendChild(row);
     }
 
-    window.addEventListener('message', (event) => {
-      const msg = event.data;
+    function onHostMessage(msg) {
+      if (!msg || !msg.type) return;
       switch (msg.type) {
         case 'health':
           healthDot.className = 'dot' + (msg.pending ? '' : (msg.ok ? ' ok' : ''));
@@ -2918,7 +3072,16 @@ class BlossomChatSession {
           compare.title = 'Open side-by-side diff';
           compare.onclick = () => vscode.postMessage({ type: 'openEditDiff', editId: msg.id });
           row.appendChild(compare);
-          if (!msg.autoApply) {
+          const restoredStatus = msg.status;
+          if (restoredStatus === 'applied' || restoredStatus === 'rejected') {
+            wrap.appendChild(row);
+            const st = document.createElement('div');
+            st.className = 'cmd-card-status';
+            st.textContent = restoredStatus === 'applied'
+              ? (msg.auto ? '✓ Auto-applied' : '✓ Applied')
+              : '✗ Rejected';
+            wrap.appendChild(st);
+          } else if (!msg.autoApply) {
             const apply = document.createElement('button');
             apply.className = 'primary';
             apply.textContent = msg.isDelete ? 'Delete' : 'Apply';
@@ -2937,7 +3100,9 @@ class BlossomChatSession {
             wrap.appendChild(st);
           }
           messagesEl.appendChild(wrap);
-          try { wrap.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (_) {}
+          if (!msg.skipScroll) {
+            try { wrap.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (_) {}
+          }
           pinBusyToBottom();
           break;
         }
@@ -3075,14 +3240,27 @@ class BlossomChatSession {
         case 'restoreHistory': {
           wipeMessages();
           const msgs = msg.messages || [];
+          const edits = Array.isArray(msg.edits) ? msg.edits : [];
+          // Older archives have no edit cards — show path-labeled fence bodies.
+          // Newer archives restore PR-style cards, so keep the live "Edit: path" labels.
+          const preserveFileFences = edits.length === 0;
           for (const m of msgs) {
             if (!m || !m.content) continue;
             if (m.role === 'user') {
               append('user', m.content);
             } else if (m.role === 'assistant') {
               const el = append('assistant', '');
-              renderAssistant(el, m.content);
+              renderAssistant(el, m.content, { preserveFileFences });
             }
+          }
+          for (const edit of edits) {
+            if (!edit || !edit.id) continue;
+            onHostMessage(Object.assign({}, edit, {
+              type: 'pendingEdit',
+              autoApply: false,
+              status: edit.status || 'applied',
+              skipScroll: true,
+            }));
           }
           const note = document.createElement('div');
           note.className = 'tool';
@@ -3116,6 +3294,10 @@ class BlossomChatSession {
           break;
         }
       }
+    }
+
+    window.addEventListener('message', (event) => {
+      onHostMessage(event.data);
     });
 
     vscode.postMessage({ type: 'ready' });
