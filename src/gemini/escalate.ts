@@ -13,6 +13,8 @@ export interface EscalateRequest {
   contextPrompt: string;
   systemPrompt: string;
   estimatedInputTokens?: number;
+  handoffChars?: number;
+  rawChars?: number;
 }
 
 export interface EscalateResult {
@@ -50,11 +52,16 @@ export async function escalateToGemini(
   const estOut = 800;
   const estCall = estimateCost(estIn, estOut);
   const model = getConfig().geminiModel;
+  const handoffNote =
+    req.handoffChars != null
+      ? `Handoff size: ~${req.handoffChars} chars compressed${req.rawChars != null ? ` (from ${req.rawChars} raw)` : ""}.`
+      : "";
 
   const choice = await vscode.window.showWarningMessage(
     [
       `Blossom wants to call Gemini (${model}).`,
       `Reason: ${req.reason}`,
+      handoffNote,
       `Est. this call: ~${formatUsd(estCall)} (~${estIn} in / ~${estOut} out tokens)`,
       `Spend today: ${formatUsd(summary.todayUsd)} (${summary.todayCalls} calls)`,
       `Spend all-time: ${formatUsd(summary.allTimeUsd)} (${summary.allTimeCalls} calls)`,

@@ -1,4 +1,15 @@
 import * as vscode from "vscode";
+import { registerBlossomDiffDocuments } from "./agent/diffDocuments";
+import {
+  invalidatePatchIndex,
+  warmPatchIndex,
+} from "./agent/patchScriptContext";
+import { connectGhidra, invalidateGhidraCache } from "./ghidra/client";
+import {
+  connectGhidraMcp,
+  invalidateGhidraMcpClient,
+  listGhidraMcpTools,
+} from "./mcp/ghidraMcpClient";
 import { clearPersonaCache, resolvePersona } from "./agent/prompts";
 import { startEditorTracking } from "./agent/editorTracker";
 import {
@@ -9,13 +20,21 @@ import {
 import { BlossomChatPanel } from "./chat/ChatPanel";
 import { checkHealth } from "./ollama/client";
 import { promptForGeminiApiKey } from "./gemini/client";
-import { showSpendReport } from "./gemini/escalate";
+import { showSpendReport as showGeminiSpend } from "./gemini/escalate";
+import { promptForCursorApiKey } from "./cursor/client";
+import { showSpendReport as showCursorSpend } from "./cursor/escalate";
+import { promptForClaudeApiKey } from "./claude/client";
+import { showSpendReport as showClaudeSpend } from "./claude/escalate";
 
 export function activate(context: vscode.ExtensionContext): void {
   startEditorTracking(context);
+  registerBlossomDiffDocuments(context);
   const chat = new BlossomChatPanel(context);
 
   if (vscode.workspace.workspaceFolders?.length) {
+    void warmPatchIndex().catch(() => undefined);
+    void connectGhidra().catch(() => undefined);
+    void connectGhidraMcp().catch(() => undefined);
     void rebuildRepoKnowledge(context).then(
       (k) =>
         console.log(
@@ -39,7 +58,86 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("blossom.showGeminiSpend", async () => {
-      await showSpendReport(context);
+      await showGeminiSpend(context);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.setCursorApiKey", async () => {
+      await promptForCursorApiKey(context);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.showCursorSpend", async () => {
+      await showCursorSpend(context);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.copyCursorHandoff", async () => {
+      await chat.copyCursorHandoff();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.setClaudeApiKey", async () => {
+      await promptForClaudeApiKey(context);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.showClaudeSpend", async () => {
+      await showClaudeSpend(context);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.retryWithLocal", async () => {
+      await chat.retryWithLocalBlossom();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.editScratchpad", async () => {
+      await chat.editScratchpad();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.showScratchpad", async () => {
+      await chat.showScratchpad();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.clearScratchpad", async () => {
+      await chat.clearScratchpad();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.openChatHistory", async () => {
+      await chat.openChatHistory();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.saveChat", async () => {
+      await chat.saveActiveChat();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("blossom.reconnectGhidra", async () => {
+      invalidateGhidraCache();
+      invalidateGhidraMcpClient();
+      const http = await connectGhidra(true);
+      const mcp = await connectGhidraMcp(true);
+      const tools = mcp ? await listGhidraMcpTools() : [];
+      void vscode.window.showInformationMessage(
+        `Ghidra: HTTP ${http ? "ok" : "off"} | MCP ${mcp ? `ok (${tools.length} tools)` : "off"}`
+      );
     })
   );
 
@@ -147,17 +245,35 @@ export function activate(context: vscode.ExtensionContext): void {
         e.affectsConfiguration("blossom.models.coding") ||
         e.affectsConfiguration("blossom.ollama.baseUrl") ||
         e.affectsConfiguration("blossom.api.baseUrl") ||
-        e.affectsConfiguration("blossom.backend")
+        e.affectsConfiguration("blossom.backend") ||
+        e.affectsConfiguration("blossom.ghidra")
       ) {
         clearPersonaCache();
+        invalidateGhidraCache();
+        invalidateGhidraMcpClient();
       }
     })
   );
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      invalidatePatchIndex();
+      invalidateGhidraCache();
+      invalidateGhidraMcpClient();
       clearRepoKnowledgeCache();
+      void warmPatchIndex().catch(() => undefined);
+      void connectGhidra().catch(() => undefined);
+      void connectGhidraMcp().catch(() => undefined);
       void rebuildRepoKnowledge(context).catch(() => undefined);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      const base = doc.fileName.split(/[/\\]/).pop() ?? "";
+      if (/^(patch_|deploy_|inject_).*\.(py|sh|c|cpp)$/i.test(base)) {
+        invalidatePatchIndex();
+      }
     })
   );
 }

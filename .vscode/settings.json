@@ -1,0 +1,14 @@
+{
+  "task.allowAutomaticTasks": "on",
+  "blossom.cursor.enabled": false,
+  "blossom.escalate.fallbackOrder": "gemini,claude",
+  "blossom.vision.onAttach": "local-caption",
+  "blossom.vision.caption.model": "moondream",
+  "blossom.vision.caption.ollamaBaseUrl": "http://127.0.0.1:11434",
+  "blossom.vision.caption.ocrFallback": true,
+  "blossom.commands.allowlist": [
+    "py",
+    "python",
+    "python3"
+  ]
+}

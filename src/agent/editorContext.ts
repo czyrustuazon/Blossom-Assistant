@@ -10,6 +10,15 @@ import {
   rememberNote,
   type RepoKnowledge,
 } from "./repoKnowledge";
+import { buildPatchScriptMapBlock, userTextWantsPatchContext } from "./patchScriptContext";
+import { buildGhidraHintBlock } from "../ghidra/client";
+import { buildGhidraMcpHintBlock } from "../mcp/ghidraMcpClient";
+import {
+  assessScratchpadNeed,
+  formatScratchpadBlock,
+  getScratchpad,
+} from "./scratchpad";
+import { detectPromptTier } from "./prompts";
 
 const MAX_FILE_CHARS = 24_000;
 const MAX_TOTAL_CHARS = 60_000;
@@ -455,6 +464,19 @@ export async function enrichWithEditorContext(
   const unusedReport = unusedBundle.report;
   const unusedPaths = unusedBundle.paths;
   const linkBrief = buildLinkTaskBrief(userText);
+  const existingPad = opts?.extensionContext
+    ? getScratchpad(opts.extensionContext)
+    : "";
+  const scratchNeed = assessScratchpadNeed(userText, {
+    existing: existingPad,
+    promptTier: detectPromptTier(userText, {
+      hasEditorContext: blocks.length > 0,
+    }),
+    attachedPathCount: attachedPaths.length,
+  });
+  const scratchBlock = opts?.extensionContext
+    ? formatScratchpadBlock(existingPad, scratchNeed)
+    : "";
 
   if (blocks.length > 0) {
     parts.push(
@@ -474,6 +496,12 @@ export async function enrichWithEditorContext(
     );
     if (linkBrief) {
       parts.push(linkBrief, "");
+    }
+    if (scratchBlock) {
+      parts.push(scratchBlock, "");
+      if (!attached.includes("scratchpad")) {
+        attached.push("scratchpad");
+      }
     }
     parts.push(
       "[EDITOR CONTEXT]",
@@ -499,7 +527,15 @@ export async function enrichWithEditorContext(
       "You are the VS Code coding assistant.",
       "When creating or editing files, use one complete markdown fence per file labeled with path=...",
       "e.g. ```html path=about.html",
-      "",
+      ""
+    );
+    if (scratchBlock) {
+      parts.push(scratchBlock, "");
+      if (!attached.includes("scratchpad")) {
+        attached.push("scratchpad");
+      }
+    }
+    parts.push(
       "[USER REQUEST]",
       userText
     );
@@ -519,6 +555,41 @@ export async function enrichWithEditorContext(
     );
     if (!attached.includes("repo knowledge")) {
       attached.push("repo knowledge");
+    }
+  }
+
+  const patchMap = await buildPatchScriptMapBlock(userText);
+  if (patchMap) {
+    parts.splice(
+      parts.findIndex((p) => p === "[USER REQUEST]") >= 0
+        ? parts.findIndex((p) => p === "[USER REQUEST]")
+        : parts.length,
+      0,
+      patchMap,
+      ""
+    );
+    if (!attached.includes("patch script map")) {
+      attached.push("patch script map");
+    }
+  } else if (userTextWantsPatchContext(userText)) {
+    parts.push(
+      "",
+      "[PATCH SCRIPT MAP]",
+      "This task touches binary/patch/RE work. Use search_replace in multiple passes — one section per pass.",
+      "Each patch_*.py / deploy_*.py owns its symbols; do not merge logic across files.",
+      "Run python <patch_path> --dry-run before Apply."
+    );
+  }
+
+  const ghidraHint = await buildGhidraHintBlock();
+  const ghidraMcpHint = await buildGhidraMcpHintBlock();
+  const ghidraCombined = [ghidraMcpHint, ghidraHint].filter(Boolean).join("\n\n");
+  if (ghidraCombined) {
+    const userIdx = parts.findIndex((p) => p === "[USER REQUEST]");
+    const insertAt = userIdx >= 0 ? userIdx : parts.length;
+    parts.splice(insertAt, 0, ghidraCombined, "");
+    if (!attached.includes("ghidra")) {
+      attached.push("ghidra");
     }
   }
 

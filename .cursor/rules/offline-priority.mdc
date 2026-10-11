@@ -1,0 +1,29 @@
+---
+description: Offline / local-first priority — no internet escalation
+alwaysApply: true
+---
+
+# Offline priority (hard)
+
+This project stays **offline-first**. Local ChatRouter / Ollama / on-machine tools are the product path.
+
+## Do
+
+- Prefer localhost backends (`127.0.0.1`, Ollama, ChatRouter, local Ghidra MCP).
+- Design vision, OCR, captioning, and coding so they work with **no cloud API calls**.
+- If hardware cannot run a capability yet, document it as an **open problem to solve** (VRAM, model size, latency). Do not “fix” it by escalating to Gemini / Claude / Cursor cloud / any internet LLM.
+
+## Do not
+
+- Add or recommend internet escalations as the default for screenshots, OCR, coding, or “when stuck.”
+- Treat cloud vision (Gemini/Claude/Cursor Agent online) as the solution path for this repo’s product behavior.
+- Silently widen `blossom.vision.onAttach` / escalate chains toward the public internet without an explicit user override for a one-off experiment.
+
+## When blocked by hardware
+
+State the gap plainly, e.g.:
+
+- “Local VL model needs ≥N GB VRAM; machine has M — problem to solve.”
+- “OCR quality on dark UI toasts is poor without preprocess — problem to solve.”
+
+Then propose **local** mitigations (smaller VL model, CPU OCR + preprocess, caption cache, crop-to-toast, etc.). Never substitute cloud.

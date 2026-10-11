@@ -60,24 +60,105 @@ interface ParsedFence {
   isDelete?: boolean;
 }
 
+/** Incremental scan state for live per-fence apply during streaming. */
+export interface FenceScanState {
+  /** End index in the buffer of the last consumed completed fence. */
+  scannedUpTo: number;
+  /** Fingerprints of fences already emitted. */
+  seen: Set<string>;
+}
+
+export interface CompletedFence extends ParsedFence {
+  endIndex: number;
+  fingerprint: string;
+}
+
+export function createFenceScanState(): FenceScanState {
+  return { scannedUpTo: 0, seen: new Set() };
+}
+
+function fenceFingerprint(fence: {
+  hintPath?: string;
+  content: string;
+  isDelete?: boolean;
+}): string {
+  const path = (fence.hintPath || "").replace(/\\/g, "/").toLowerCase();
+  const kind = fence.isDelete ? "del" : "write";
+  const c = fence.content;
+  let h = 0;
+  for (let i = 0; i < c.length; i++) {
+    h = ((h << 5) - h + c.charCodeAt(i)) | 0;
+  }
+  return `${kind}:${path}:${c.length}:${h}`;
+}
+
+function parseFenceAtMatch(
+  text: string,
+  infoRaw: string,
+  bodyRaw: string,
+  start: number
+): ParsedFence | null {
+  const info = (infoRaw ?? "").trim();
+  const content = (bodyRaw ?? "").replace(/\n$/, "");
+  const before = text.slice(Math.max(0, start - 320), start);
+  const headingPath = extractHeadingPathBeforeFence(before);
+  const { hintPath, hintExt } = extractPathHints(info, content, headingPath);
+  const infoIsDelete = /\b(?:delete|remove)(?:_file)?\b/i.test(info);
+  const bodyIsDelete = isDeleteMarker(content);
+  const isDelete = infoIsDelete || bodyIsDelete;
+
+  // Skip tiny fences unless they are explicit deletes (empty / DELETE body).
+  if (!isDelete && (!content.trim() || content.length < 8)) {
+    return null;
+  }
+  return { info, content, hintPath, hintExt, isDelete };
+}
+
+/**
+ * Return newly completed fences since the last scan.
+ * Only fully closed ```…``` blocks are emitted; the open trailing fence waits.
+ */
+export function consumeCompletedFences(
+  buffer: string,
+  state: FenceScanState
+): CompletedFence[] {
+  const out: CompletedFence[] = [];
+  const re = new RegExp(FENCE_RE.source, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(buffer)) !== null) {
+    const start = m.index;
+    const end = start + m[0].length;
+    if (end <= state.scannedUpTo) {
+      continue;
+    }
+
+    const parsed = parseFenceAtMatch(buffer, m[1] ?? "", m[2] ?? "", start);
+    if (!parsed) {
+      // Advance past noise fences so we do not rescan them forever.
+      state.scannedUpTo = end;
+      continue;
+    }
+
+    const fingerprint = fenceFingerprint(parsed);
+    if (state.seen.has(fingerprint)) {
+      state.scannedUpTo = Math.max(state.scannedUpTo, end);
+      continue;
+    }
+    state.seen.add(fingerprint);
+    state.scannedUpTo = end;
+    out.push({ ...parsed, endIndex: end, fingerprint });
+  }
+  return out;
+}
+
 function parseFences(text: string): ParsedFence[] {
   const out: ParsedFence[] = [];
   for (const m of text.matchAll(FENCE_RE)) {
-    const info = (m[1] ?? "").trim();
-    const content = (m[2] ?? "").replace(/\n$/, "");
     const start = m.index ?? 0;
-    const before = text.slice(Math.max(0, start - 320), start);
-    const headingPath = extractHeadingPathBeforeFence(before);
-    const { hintPath, hintExt } = extractPathHints(info, content, headingPath);
-    const infoIsDelete = /\b(?:delete|remove)(?:_file)?\b/i.test(info);
-    const bodyIsDelete = isDeleteMarker(content);
-    const isDelete = infoIsDelete || bodyIsDelete;
-
-    // Skip tiny fences unless they are explicit deletes (empty / DELETE body).
-    if (!isDelete && (!content.trim() || content.length < 8)) {
-      continue;
+    const parsed = parseFenceAtMatch(text, m[1] ?? "", m[2] ?? "", start);
+    if (parsed) {
+      out.push(parsed);
     }
-    out.push({ info, content, hintPath, hintExt, isDelete });
   }
   return out;
 }
@@ -449,7 +530,7 @@ function extOf(p: string): string {
   return dot >= 0 ? b.slice(dot) : "";
 }
 
-function pathsMatch(a: string, b: string): boolean {
+export function pathsMatch(a: string, b: string): boolean {
   const na = a.replace(/\\/g, "/").toLowerCase();
   const nb = b.replace(/\\/g, "/").toLowerCase();
   return (
@@ -506,6 +587,9 @@ export async function proposeEditsFromAssistantReply(
     /** When true and preDeletePaths is non-empty, ignore model deletes outside that set. */
     lockDeletesToUserTargets?: boolean;
     onSkippedDelete?: (path: string, reason: string) => void;
+    onSkippedWrite?: (path: string, reason: string) => void;
+    /** Paths already proposed/applied mid-stream — skip re-propose. */
+    skipPaths?: string[];
   }
 ): Promise<{ count: number; edits: PendingEdit[] }> {
   if (!assistantText && preDeletePaths.length === 0) {
@@ -520,6 +604,9 @@ export async function proposeEditsFromAssistantReply(
   const deletedPaths: string[] = [];
   const lockDeletes =
     Boolean(opts?.lockDeletesToUserTargets) && preDeletePaths.length > 0;
+  const skipPaths = opts?.skipPaths ?? [];
+  const shouldSkip = (path: string): boolean =>
+    skipPaths.some((p) => pathsMatch(p, path));
 
   const pushEdit = async (edit: PendingEdit): Promise<void> => {
     const accepted = await onPendingEdit(edit);
@@ -535,6 +622,9 @@ export async function proposeEditsFromAssistantReply(
     source: "user" | "model"
   ): Promise<void> => {
     const norm = path.replace(/\\/g, "/");
+    if (shouldSkip(norm)) {
+      return;
+    }
     if (deletedPaths.some((p) => pathsMatch(p, norm))) {
       return;
     }
@@ -563,7 +653,11 @@ export async function proposeEditsFromAssistantReply(
   };
 
   // 0) User-requested deletes first (e.g. "delete marks" → marks.html)
+  // Skip ones already live-delivered mid-stream.
   for (const p of preDeletePaths) {
+    if (shouldSkip(p)) {
+      continue;
+    }
     await proposeDelete(p, "user");
   }
   for (const p of extractDeletePathsFromText(assistantText || "")) {
@@ -615,7 +709,7 @@ export async function proposeEditsFromAssistantReply(
       continue;
     }
     const path = fence.hintPath.replace(/\\/g, "/");
-    if (deletedPaths.some((p) => pathsMatch(p, path))) {
+    if (shouldSkip(path) || deletedPaths.some((p) => pathsMatch(p, path))) {
       usedFences.add(i);
       continue;
     }
@@ -623,11 +717,16 @@ export async function proposeEditsFromAssistantReply(
     const result = await proposeFileEdit(path, fence.content);
     if (result.ok && result.pendingEdit) {
       await pushEdit(result.pendingEdit);
+    } else if (!result.ok) {
+      opts?.onSkippedWrite?.(path, result.content || "write blocked");
     }
   }
 
   // 2) For attached files still missing an assignment, pick best remaining fence
   for (const path of attachedPaths.map((p) => p.replace(/\\/g, "/"))) {
+    if (shouldSkip(path)) {
+      continue;
+    }
     if (edits.some((e) => pathsMatch(e.relativePath, path))) {
       continue;
     }
@@ -678,6 +777,8 @@ export async function proposeEditsFromAssistantReply(
     const result = await proposeFileEdit(path, fences[bestIdx].content);
     if (result.ok && result.pendingEdit) {
       await pushEdit(result.pendingEdit);
+    } else if (!result.ok) {
+      opts?.onSkippedWrite?.(path, result.content || "write blocked");
     }
   }
 

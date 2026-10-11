@@ -2,7 +2,7 @@
   "name": "blossom-assistant",
   "displayName": "Blossom Assistant",
   "description": "Local coding assistant for VS Code via Blossom ChatRouter (or Ollama).",
-  "version": "0.1.44",
+  "version": "0.1.55",
   "publisher": "blossom",
   "icon": "media/icon.png",
   "engines": {
@@ -19,7 +19,12 @@
     "onCommand:blossom.refreshPersona",
     "onCommand:blossom.showPersona",
     "onCommand:blossom.refreshRepoKnowledge",
-    "onCommand:blossom.showRepoKnowledge"
+    "onCommand:blossom.showRepoKnowledge",
+    "onCommand:blossom.editScratchpad",
+    "onCommand:blossom.showScratchpad",
+    "onCommand:blossom.clearScratchpad",
+    "onCommand:blossom.openChatHistory",
+    "onCommand:blossom.saveChat"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -49,6 +54,11 @@
         "category": "Blossom"
       },
       {
+        "command": "blossom.reconnectGhidra",
+        "title": "Reconnect Ghidra (HTTP + MCP)",
+        "category": "Blossom"
+      },
+      {
         "command": "blossom.refreshPersona",
         "title": "Refresh Persona from Ollama",
         "category": "Blossom"
@@ -66,6 +76,61 @@
       {
         "command": "blossom.showRepoKnowledge",
         "title": "Show Repo Knowledge",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.setCursorApiKey",
+        "title": "Set Cursor API Key",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.showCursorSpend",
+        "title": "Show Cursor Escalation Count",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.copyCursorHandoff",
+        "title": "Copy Cursor Handoff",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.setClaudeApiKey",
+        "title": "Set Claude API Key",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.showClaudeSpend",
+        "title": "Show Claude Spend",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.retryWithLocal",
+        "title": "Retry with Local Blossom",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.editScratchpad",
+        "title": "Edit Scratchpad",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.showScratchpad",
+        "title": "Show Scratchpad",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.clearScratchpad",
+        "title": "Clear Scratchpad",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.openChatHistory",
+        "title": "Open Chat History",
+        "category": "Blossom"
+      },
+      {
+        "command": "blossom.saveChat",
+        "title": "Save Current Chat",
         "category": "Blossom"
       }
     ],
@@ -88,7 +153,10 @@
       "properties": {
         "blossom.backend": {
           "type": "string",
-          "enum": ["chatRouter", "ollama"],
+          "enum": [
+            "chatRouter",
+            "ollama"
+          ],
           "default": "chatRouter",
           "description": "LLM backend. 'chatRouter' = Blossom ChatRouter (OpenAI-compatible on :8081). 'ollama' = native Ollama /api/chat."
         },
@@ -119,7 +187,12 @@
         },
         "blossom.persona.source": {
           "type": "string",
-          "enum": ["router", "ollama", "settings", "ollama+settings"],
+          "enum": [
+            "router",
+            "ollama",
+            "settings",
+            "ollama+settings"
+          ],
           "default": "router",
           "description": "Optional personality source. 'router' = ChatRouter CompanionEngine (recommended)."
         },
@@ -158,6 +231,26 @@
           "default": 0.4,
           "description": "Estimated USD per 1M output tokens."
         },
+        "blossom.claude.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow ESCALATE_CLAUDE → Anthropic API (text-only escalate)."
+        },
+        "blossom.claude.model": {
+          "type": "string",
+          "default": "claude-sonnet-4-20250514",
+          "description": "Claude model for confirm-gated Blossom escalations."
+        },
+        "blossom.claude.inputPricePer1M": {
+          "type": "number",
+          "default": 3,
+          "description": "Estimated USD per 1M input tokens (spend tracker)."
+        },
+        "blossom.claude.outputPricePer1M": {
+          "type": "number",
+          "default": 15,
+          "description": "Estimated USD per 1M output tokens (spend tracker)."
+        },
         "blossom.edits.autoApply": {
           "type": "boolean",
           "default": true,
@@ -167,6 +260,65 @@
           "type": "boolean",
           "default": true,
           "description": "After Apply or Auto-apply, save the file to disk immediately (no extra Ctrl+S)."
+        },
+        "blossom.edits.contentGuard": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), block Apply/auto-apply that would replace executable source with README/markdown prose, or gut a code file without preserving imports/functions. Lets auto-apply stay on for real code revisions."
+        },
+        "blossom.edits.dryRunGate": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), block Apply/auto-apply on patch_*.py, deploy_*.py, and tools/*.py until run_command succeeds with --dry-run (or a python -c smoke import) for that script in the same turn."
+        },
+        "blossom.edits.openDiffOnReplace": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), open a side-by-side vscode.diff (before/after) as each search_replace lands, in addition to the PR-style diff card in chat."
+        },
+        "blossom.commands.askBeforeRun": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), Blossom pauses and asks before running shell commands (run_command). Use Run / Always allow / Deny in chat. Turn off via the Fast mode button in the chat input to auto-run commands."
+        },
+        "blossom.commands.allowlist": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "py",
+            "python",
+            "python3"
+          ],
+          "description": "Shell commands that skip the Run prompt. Use a first token (e.g. ls, git), an exact command, or a prefix with * (e.g. git status*). Always allow in chat adds the first token. Defaults allow Python probes/scratch scripts."
+        },
+        "blossom.agent.toolProfile": {
+          "type": "string",
+          "enum": ["auto", "minimal", "research", "full"],
+          "default": "auto",
+          "description": "Tool catalog injected into coding prompts. auto = tiny→minimal, plan→research, full→full (aliases omitted from catalog)."
+        },
+        "blossom.agent.toolResultMaxChars": {
+          "type": "number",
+          "default": 2500,
+          "description": "Max characters for the latest tool result kept in the agent transcript (run_command/search/read compaction)."
+        },
+        "blossom.agent.maxToolRounds": {
+          "type": "number",
+          "default": 12,
+          "description": "Hard cap on agent tool rounds per turn."
+        },
+        "blossom.agent.stepMode": {
+          "type": "string",
+          "enum": ["off", "confirmTools", "planSteps"],
+          "default": "off",
+          "description": "HITL gates: off (default), confirmTools (pause every N tool rounds), planSteps (pause after write/delete tools so you can review diffs)."
+        },
+        "blossom.agent.confirmToolsAfterRounds": {
+          "type": "number",
+          "default": 3,
+          "description": "When blossom.agent.stepMode is confirmTools, pause for Continue/Stop after this many tool rounds."
         },
         "blossom.siblingPeek.enabled": {
           "type": "boolean",
@@ -182,19 +334,183 @@
           "type": "number",
           "default": 100000,
           "description": "Max bytes read from a related-folder file."
+        },
+        "blossom.cursor.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow ESCALATE_CURSOR → Cursor SDK agent (uses Cursor subscription). Off by default — use local tools + optional Gemini/Claude text escalate."
+        },
+        "blossom.cursor.model": {
+          "type": "string",
+          "default": "composer-2.5",
+          "description": "Cursor SDK model id for escalations."
+        },
+        "blossom.handoff.maxSummaryChars": {
+          "type": "number",
+          "default": 6000,
+          "description": "Max chars for compressed session summary before cloud escalate."
+        },
+        "blossom.handoff.summarizeThresholdChars": {
+          "type": "number",
+          "default": 12000,
+          "description": "Raw history above this triggers LLM summarize before cloud escalate."
+        },
+        "blossom.handoff.summarizeProvider": {
+          "type": "string",
+          "enum": [
+            "local",
+            "gemini",
+            "rules-only"
+          ],
+          "default": "local",
+          "description": "Pre-cloud summarizer (never uses Cursor tokens)."
+        },
+        "blossom.escalate.fallbackOrder": {
+          "type": "string",
+          "default": "gemini,claude",
+          "description": "When one provider fails/declined, offer next with same compressed handoff."
+        },
+        "blossom.escalate.fallbackEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Try next provider in fallbackOrder after decline/failure."
+        },
+        "blossom.escalate.askFirst": {
+          "type": "boolean",
+          "default": true,
+          "description": "Before any cloud call (ChatRouter auto-fallback or local ESCALATE_* markers), show a picker: Gemini / Claude / stay local (Cursor only if blossom.cursor.enabled)."
+        },
+        "blossom.escalate.applyFromCloud": {
+          "type": "boolean",
+          "default": true,
+          "description": "After a cloud escalation answer, parse path= code fences into Apply cards (same as local Blossom)."
+        },
+        "blossom.vision.onAttach": {
+          "type": "string",
+          "enum": [
+            "local-caption",
+            "metadata-only",
+            "escalate"
+          ],
+          "default": "local-caption",
+          "description": "When images are attached: local-caption runs offline Ollama VL (+ optional OCR) and injects [IMAGE CAPTION] for the local coder (default). metadata-only = dimensions/RGB only. escalate = Cursor/cloud path (not offline-first)."
+        },
+        "blossom.vision.caption.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run local vision caption when onAttach is local-caption."
+        },
+        "blossom.vision.caption.model": {
+          "type": "string",
+          "default": "moondream",
+          "description": "Ollama multimodal model tag for offline image captioning (e.g. moondream, llava, qwen2-vl)."
+        },
+        "blossom.vision.caption.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Local Ollama base URL used only for vision captioning (can differ from ChatRouter coding URL)."
+        },
+        "blossom.vision.caption.timeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "Timeout for one local VL caption call."
+        },
+        "blossom.vision.caption.ocrFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "If Ollama VL fails, try local Tesseract OCR (with optional Pillow invert preprocess)."
+        },
+        "blossom.vision.caption.ocrCommand": {
+          "type": "string",
+          "default": "tesseract",
+          "description": "OCR executable on PATH (or absolute path)."
+        },
+        "blossom.vision.caption.maxImages": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Max images to caption per turn."
+        },
+        "blossom.deescalate.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "After a cloud escalation answer, offer Retry with local Blossom (uses cloud text as read-only reference)."
+        },
+        "blossom.ghidra.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable read_ghidra tool (HTTP bridge to Ghidra MCP plugin)."
+        },
+        "blossom.ghidra.baseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Ghidra HTTP bridge URL (e.g. http://127.0.0.1:8089). Empty = auto-discover on localhost ports."
+        },
+        "blossom.ghidra.autoDiscover": {
+          "type": "boolean",
+          "default": true,
+          "description": "Probe localhost ports for Ghidra MCP HTTP bridge when baseUrl is empty."
+        },
+        "blossom.ghidra.discoveryPorts": {
+          "type": "array",
+          "default": [
+            8089,
+            8192,
+            8080,
+            9090
+          ],
+          "description": "Ports to probe for Ghidra HTTP bridge (blossom.ghidra.autoDiscover)."
+        },
+        "blossom.ghidra.cacheTtlMs": {
+          "type": "number",
+          "default": 60000,
+          "description": "How long to cache Ghidra connection discovery (ms)."
+        },
+        "blossom.ghidra.transport": {
+          "type": "string",
+          "enum": ["http", "mcp", "both"],
+          "default": "both",
+          "description": "Ghidra integration: HTTP read_ghidra, stdio MCP ghidra_mcp, or both."
+        },
+        "blossom.ghidra.mcp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable local Ghidra MCP bridge (stdio) via ghidra_mcp tool — no Cursor tokens."
+        },
+        "blossom.ghidra.mcp.command": {
+          "type": "string",
+          "default": "",
+          "description": "Python executable for bridge_mcp_ghidra.py. Empty = read ~/.cursor/mcp.json ghidra server."
+        },
+        "blossom.ghidra.mcp.args": {
+          "type": "array",
+          "default": [],
+          "description": "Args for MCP bridge (typically path to bridge_mcp_ghidra.py)."
+        },
+        "blossom.ghidra.mcp.toolAllowlist": {
+          "type": "array",
+          "default": [],
+          "description": "MCP tools the local model may call (empty = safe default set). Add names as needed."
         }
       }
     }
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.26",
+    "@modelcontextprotocol/sdk": "^1.32.1"
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "tsc --noEmit -p ./"
+    "lint": "tsc --noEmit -p ./",
+    "package": "vsce package --allow-missing-repository"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.7.1",
     "typescript": "^5.3.3"
   }
 }

@@ -1,8 +1,37 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import { getConfig, resolveBrandIconUri } from "../config";
-import { AgentOrchestrator } from "../agent/orchestrator";
+import {
+  openDiffOnReplaceEnabled,
+  openPendingEditDiff,
+} from "../agent/diffDocuments";
+import { diffFileContents } from "../agent/lineDiff";
+import { getPendingEdit, type PendingEdit } from "../agent/tools";
+import { AgentOrchestrator, type OrchestratorEvents } from "../agent/orchestrator";
 import { checkHealth } from "../ollama/client";
+import { sendCorrectnessFeedback } from "../feedback/client";
+import {
+  buildImageAttachment,
+  pickImageAttachments,
+  type ImageAttachment,
+} from "./attachments";
+import {
+  clearScratchpad,
+  getScratchpad,
+  SCRATCHPAD_MAX_CHARS,
+  setScratchpad,
+  scratchpadStatus,
+} from "../agent/scratchpad";
+import {
+  deleteChatArchive,
+  historyForRestore,
+  listChatArchives,
+  loadChatArchive,
+  newChatArchiveId,
+  saveChatArchive,
+  uiMessagesFromArchive,
+  type ChatArchive,
+} from "../agent/chatArchive";
 
 /**
  * Host for Blossom chat tabs in the editor area.
@@ -14,6 +43,7 @@ export class BlossomChatPanel {
 
   private static nextTab = 1;
   private readonly sessions = new Set<BlossomChatSession>();
+  private lastActiveSession?: BlossomChatSession;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     const configListener = vscode.workspace.onDidChangeConfiguration((e) => {
@@ -31,7 +61,7 @@ export class BlossomChatPanel {
     this.openNewChat();
   }
 
-  openNewChat(): void {
+  openNewChat(opts?: { archive?: ChatArchive }): void {
     const tabIndex = BlossomChatPanel.nextTab++;
     const column = this.pickColumn();
     const session = new BlossomChatSession(
@@ -40,9 +70,208 @@ export class BlossomChatPanel {
       column,
       () => {
         this.sessions.delete(session);
-      }
+        if (this.lastActiveSession === session) {
+          this.lastActiveSession = undefined;
+        }
+      },
+      (active) => {
+        this.lastActiveSession = active;
+      },
+      opts?.archive
     );
     this.sessions.add(session);
+    this.lastActiveSession = session;
+  }
+
+  /** Pick a saved chat and open it in a new tab. */
+  async openChatHistory(): Promise<void> {
+    const entries = await listChatArchives();
+    if (!entries.length) {
+      void vscode.window.showInformationMessage(
+        "No saved Blossom chats yet. Chats are saved automatically after each reply (workspace must be open)."
+      );
+      return;
+    }
+
+    type HistItem = vscode.QuickPickItem & {
+      archiveId: string;
+      action: "open" | "delete";
+    };
+
+    const items: HistItem[] = entries.map((e) => {
+      const when = e.updatedAt.replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+      return {
+        label: e.title,
+        description: when,
+        detail: `${e.messageCount} messages · ${e.preview}`,
+        archiveId: e.id,
+        action: "open" as const,
+      };
+    });
+    items.push({
+      label: "$(trash) Delete a saved chat…",
+      description: "",
+      archiveId: "",
+      action: "delete",
+    });
+
+    const picked = await vscode.window.showQuickPick(items, {
+      title: "Blossom chat history",
+      placeHolder: "Open a past chat to revisit or continue",
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (!picked) {
+      return;
+    }
+
+    if (picked.action === "delete") {
+      await this.deleteChatHistoryPick();
+      return;
+    }
+
+    const archive = await loadChatArchive(picked.archiveId);
+    if (!archive) {
+      void vscode.window.showWarningMessage(
+        `Could not load saved chat "${picked.archiveId}".`
+      );
+      return;
+    }
+    this.openNewChat({ archive });
+  }
+
+  private async deleteChatHistoryPick(): Promise<void> {
+    const entries = await listChatArchives();
+    if (!entries.length) {
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(
+      entries.map((e) => ({
+        label: e.title,
+        description: e.updatedAt.replace("T", " ").replace(/\.\d{3}Z$/, ""),
+        detail: e.id,
+        id: e.id,
+      })),
+      {
+        title: "Delete saved Blossom chat",
+        placeHolder: "Select a chat to delete permanently",
+      }
+    );
+    if (!picked) {
+      return;
+    }
+    const confirm = await vscode.window.showWarningMessage(
+      `Delete saved chat “${picked.label}”?`,
+      { modal: true },
+      "Delete"
+    );
+    if (confirm !== "Delete") {
+      return;
+    }
+    await deleteChatArchive(picked.id);
+    void vscode.window.showInformationMessage("Saved chat deleted.");
+  }
+
+  /** Force-save the active chat now (also happens automatically after each turn). */
+  async saveActiveChat(): Promise<void> {
+    const session = this.lastActiveSession ?? [...this.sessions].pop();
+    if (!session) {
+      void vscode.window.showWarningMessage(
+        "Open a Blossom chat tab first, then try again."
+      );
+      return;
+    }
+    const saved = await session.persistArchive();
+    if (!saved) {
+      void vscode.window.showInformationMessage(
+        "Nothing to save yet (send a message first, and open a workspace folder)."
+      );
+      return;
+    }
+    void vscode.window.showInformationMessage(
+      `Saved chat “${saved.title}” (.blossom/chats).`
+    );
+  }
+
+  /** Copy compressed session handoff for Cursor IDE (P0). */
+  async copyCursorHandoff(): Promise<void> {
+    const session = this.lastActiveSession ?? [...this.sessions].pop();
+    if (!session) {
+      void vscode.window.showWarningMessage(
+        "Open a Blossom chat tab first, then try again."
+      );
+      return;
+    }
+    await session.copyCursorHandoff();
+  }
+
+  /** Retry the last cloud escalation answer with local Blossom (P2 de-escalate). */
+  async retryWithLocalBlossom(): Promise<void> {
+    const session = this.lastActiveSession ?? [...this.sessions].pop();
+    if (!session) {
+      void vscode.window.showWarningMessage(
+        "Open a Blossom chat tab first, then try again."
+      );
+      return;
+    }
+    await session.retryWithLocalBlossom();
+  }
+
+  /** Push current scratchpad chip state to every open chat tab. */
+  broadcastScratchpad(): void {
+    for (const session of this.sessions) {
+      session.postScratchpadState();
+    }
+  }
+
+  async editScratchpad(): Promise<void> {
+    const current = getScratchpad(this.context);
+    const value = await vscode.window.showInputBox({
+      title: "Blossom Scratchpad",
+      prompt: `Working notes for coding turns (max ${SCRATCHPAD_MAX_CHARS} chars). Injected each turn; not durable memory.`,
+      value: current,
+      placeHolder: "Goals, decisions, paths tried, blockers…",
+      ignoreFocusOut: true,
+    });
+    if (value === undefined) {
+      return;
+    }
+    const next = await setScratchpad(this.context, value);
+    const st = scratchpadStatus(next);
+    this.broadcastScratchpad();
+    void vscode.window.showInformationMessage(
+      st.empty
+        ? "Blossom scratchpad cleared."
+        : `Blossom scratchpad saved (${st.chars} chars).`
+    );
+  }
+
+  async showScratchpad(): Promise<void> {
+    const current = getScratchpad(this.context);
+    const doc = await vscode.workspace.openTextDocument({
+      content: current || "(empty — use Blossom: Edit Scratchpad, or a ```scratchpad fence from the agent)",
+      language: "markdown",
+    });
+    await vscode.window.showTextDocument(doc, { preview: true });
+  }
+
+  async clearScratchpad(): Promise<void> {
+    const current = getScratchpad(this.context);
+    if (!current.trim()) {
+      void vscode.window.showInformationMessage("Blossom scratchpad is already empty.");
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      "Clear the workspace scratchpad?",
+      { modal: true },
+      "Clear"
+    );
+    if (choice !== "Clear") {
+      return;
+    }
+    await clearScratchpad(this.context);
+    this.broadcastScratchpad();
+    void vscode.window.showInformationMessage("Blossom scratchpad cleared.");
   }
 
   /** Prefer the column of a visible Blossom tab so the new one stacks as a sibling tab. */
@@ -70,15 +299,33 @@ class BlossomChatSession {
   private topicSummary: string | undefined;
   /** Last user ask — attached to error events for Retry. */
   private lastAsk = "";
+  /** Durable archive id under .blossom/chats (new per Clear). */
+  private archiveId = newChatArchiveId();
+  private archiveCreatedAt = new Date().toISOString();
+  /** Pending UI restore after webview ready (opened from history). */
+  private pendingRestore?: ChatArchive;
+  /** Keep edit payloads for Compare after auto-apply clears pendingEdits. */
+  private readonly editDiffCache = new Map<string, PendingEdit>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     tabIndex: number,
     column: vscode.ViewColumn,
-    onDispose: () => void
+    onDispose: () => void,
+    private readonly onActivate?: (session: BlossomChatSession) => void,
+    initialArchive?: ChatArchive
   ) {
     this.tabIndex = tabIndex;
     this.orchestrator = new AgentOrchestrator(context);
+
+    if (initialArchive) {
+      this.archiveId = initialArchive.id;
+      this.archiveCreatedAt = initialArchive.createdAt || this.archiveCreatedAt;
+      this.topicSummary = initialArchive.title;
+      const restored = historyForRestore(initialArchive);
+      this.orchestrator.restoreArchive(restored);
+      this.pendingRestore = initialArchive;
+    }
 
     const icon = resolveBrandIconUri(this.context.extensionUri);
     const roots = this.webviewRoots(icon);
@@ -106,6 +353,7 @@ class BlossomChatSession {
 
     this.panel.onDidDispose(
       () => {
+        void this.persistArchive();
         this.orchestrator.cancel();
         onDispose();
       },
@@ -116,12 +364,63 @@ class BlossomChatSession {
     void this.postHealth();
   }
 
+  async persistArchive(): Promise<ChatArchive | undefined> {
+    const snap = this.orchestrator.getArchiveSnapshot();
+    if (!snap.history.length && !snap.historySummary?.trim()) {
+      return undefined;
+    }
+    return saveChatArchive({
+      id: this.archiveId,
+      title: this.topicSummary,
+      history: snap.history,
+      historySummary: snap.historySummary,
+      createdAt: this.archiveCreatedAt,
+    });
+  }
+
+  private beginFreshArchive(): void {
+    this.archiveId = newChatArchiveId();
+    this.archiveCreatedAt = new Date().toISOString();
+  }
+
+  private postRestoreIfNeeded(): void {
+    const archive = this.pendingRestore;
+    if (!archive) {
+      return;
+    }
+    this.pendingRestore = undefined;
+    const messages = uiMessagesFromArchive(archive);
+    this.post({
+      type: "restoreHistory",
+      title: archive.title,
+      messages,
+    });
+  }
+
   get visible(): boolean {
     return this.panel.visible;
   }
 
   get viewColumn(): vscode.ViewColumn | undefined {
     return this.panel.viewColumn;
+  }
+
+  async copyCursorHandoff(): Promise<void> {
+    const { copyCursorHandoff } = await import("../cursor/handoff");
+    await copyCursorHandoff(this.context, this.orchestrator);
+  }
+
+  async retryWithLocalBlossom(): Promise<void> {
+    await this.runDeescalateRetry();
+  }
+
+  postScratchpadState(): void {
+    const st = scratchpadStatus(getScratchpad(this.context));
+    this.post({
+      type: "scratchpad",
+      empty: st.empty,
+      chars: st.chars,
+    });
   }
 
   private tabTitle(): string {
@@ -188,7 +487,7 @@ class BlossomChatSession {
     this.post({
       type: "health",
       ok: health.ok,
-      detail: `${health.detail} · ${stamp}`,
+      detail: `v${this.context.extension.packageJSON.version} · ${health.detail} · ${stamp}`,
       pending: false,
     });
     if (opts?.announce) {
@@ -199,16 +498,228 @@ class BlossomChatSession {
     }
   }
 
+  private async handlePickImages(): Promise<void> {
+    const picked = await pickImageAttachments();
+    if (!picked.length) {
+      return;
+    }
+    this.post({
+      type: "imageAttachments",
+      items: picked.map((a) => ({
+        path: a.path,
+        fileName: a.fileName,
+        metadata: a.metadata,
+      })),
+    });
+  }
+
   private post(message: unknown): void {
     void this.panel.webview.postMessage(message);
+  }
+
+  private orchestratorEvents(turnFeedbackId: {
+    id?: string;
+  }): OrchestratorEvents {
+    return {
+      onStatus: (statusText, opts) => {
+        const t = (statusText || "").trim();
+        if (!t) {
+          return;
+        }
+        this.post({
+          type: "status",
+          text: t,
+          phaseOnly: !!opts?.phaseOnly,
+        });
+      },
+      onMode: (mode, model, source) =>
+        this.post({ type: "mode", mode, model, source }),
+      onToken: (delta) => this.post({ type: "token", text: delta }),
+      onStreamBreak: () => this.post({ type: "streamBreak" }),
+      onThought: (thought) => {
+        const step = (thought.step || "").toLowerCase();
+        if (step === "model_reasoning" && thought.message?.trim()) {
+          this.post({ type: "reasoning", text: thought.message });
+        }
+      },
+      onTool: (name, detail) => this.post({ type: "tool", name, detail }),
+      onPendingCommand: (req) =>
+        this.post({
+          type: "pendingCommand",
+          id: req.id,
+          command: req.command,
+          cwd: req.cwd,
+          root: req.root,
+        }),
+      onCommandResolved: (id, result) =>
+        this.post({
+          type: "commandResolved",
+          id,
+          decision: result.decision,
+          detail: result.detail,
+        }),
+      onPendingStep: (req) =>
+        this.post({
+          type: "pendingStep",
+          id: req.id,
+          reason: req.reason,
+          detail: req.detail,
+        }),
+      onStepResolved: (id, result) =>
+        this.post({
+          type: "stepResolved",
+          id,
+          decision: result.decision,
+          detail: result.detail,
+        }),
+      onPendingEdit: (edit, meta) => {
+        const isDelete = edit.kind === "delete";
+        const isNew = !isDelete && !edit.oldContent;
+        const diff = isDelete
+          ? diffFileContents(edit.oldContent || "", "")
+          : diffFileContents(edit.oldContent || "", edit.newContent || "");
+        const preview = edit.replacePreview;
+        this.editDiffCache.set(edit.id, { ...edit });
+        this.post({
+          type: "pendingEdit",
+          id: edit.id,
+          path: edit.relativePath,
+          isNew,
+          isDelete,
+          source:
+            edit.source ||
+            (isDelete ? "delete" : isNew ? "write_file" : "write_file"),
+          autoApply: !!meta?.autoApply,
+          replacePreview: preview
+            ? {
+                oldString: preview.oldString,
+                newString: preview.newString,
+                replaceAll: !!preview.replaceAll,
+                matchCount: preview.matchCount ?? 1,
+              }
+            : undefined,
+          diff: {
+            additions: diff.additions,
+            deletions: diff.deletions,
+            truncated: diff.truncated,
+            hunks: diff.hunks.map((h) => ({
+              header: h.header,
+              oldStart: h.oldStart,
+              newStart: h.newStart,
+              lines: h.lines.map((l) => ({
+                kind: l.kind,
+                text: l.text,
+                oldLine: l.oldLine,
+                newLine: l.newLine,
+                segments: l.segments,
+              })),
+            })),
+          },
+        });
+        // Realtime side-by-side for search_replace (GitHub-PR feel in the editor).
+        if (
+          edit.source === "search_replace" &&
+          openDiffOnReplaceEnabled() &&
+          !isDelete
+        ) {
+          void openPendingEditDiff(edit).catch(() => undefined);
+        }
+      },
+      onEditNeedsApply: (id) => this.post({ type: "editNeedsApply", id }),
+      onEditApplied: (id, path) => {
+        this.orchestrator.noteFileApplied(path, true);
+        this.post({ type: "editApplied", id, path, auto: true });
+      },
+      onCodingSummary: (summary) =>
+        this.post({
+          type: "codingSummary",
+          backend: summary.backend,
+          created: summary.created,
+          updated: summary.updated,
+          deleted: summary.deleted ?? [],
+          autoApplied: summary.autoApplied,
+          modelNotes: summary.modelNotes ?? [],
+        }),
+      onFeedback: (info) => {
+        turnFeedbackId.id = info.id;
+      },
+      onContextInject: (block) => {
+        const preview =
+          block.split("\n").find((l) => l.trim() && !l.startsWith("[")) ||
+          block;
+        this.post({
+          type: "status",
+          text: `Incorporating: ${preview.slice(0, 80)}${preview.length > 80 ? "…" : ""}`,
+          phaseOnly: true,
+        });
+      },
+      onScratchpad: (info) => {
+        this.post({
+          type: "scratchpad",
+          empty: info.empty,
+          chars: info.chars,
+        });
+      },
+      onDone: (finalText, opts) => {
+        this.post({
+          type: "autoApply",
+          enabled: this.orchestrator.getAutoApply(),
+        });
+        this.post({
+          type: "fastMode",
+          enabled: this.orchestrator.getFastMode(),
+        });
+        this.postScratchpadState();
+        this.post({
+          type: "assistantDone",
+          text: finalText,
+          feedbackId: turnFeedbackId.id,
+          deescalateAvailable: !!opts?.deescalateAvailable,
+        });
+      },
+      onError: (message) =>
+        this.post({
+          type: "error",
+          text: message,
+          question: this.lastAsk,
+        }),
+    };
+  }
+
+  private async runDeescalateRetry(): Promise<void> {
+    if (!this.orchestrator.canDeescalate()) {
+      this.post({
+        type: "error",
+        text: "No cloud answer available to retry locally.",
+      });
+      return;
+    }
+    this.post({ type: "assistantStart" });
+    this.post({
+      type: "status",
+      text: "Retrying with local Blossom…",
+      phaseOnly: true,
+    });
+    const turnFeedbackId: { id?: string } = {};
+    await this.orchestrator.retryWithLocalBlossom(
+      this.orchestratorEvents(turnFeedbackId)
+    );
+    void this.persistArchive();
   }
 
   private async onMessage(msg: {
     type: string;
     text?: string;
     editId?: string;
+    commandId?: string;
+    stepId?: string;
+    decision?: string;
     command?: string;
     enabled?: boolean;
+    feedbackId?: string;
+    verdict?: string;
+    attachments?: Array<{ path: string; fileName: string; metadata?: string }>;
+    paths?: string[];
   }): Promise<void> {
     switch (msg.type) {
       case "ready":
@@ -217,88 +728,140 @@ class BlossomChatSession {
           type: "autoApply",
           enabled: this.orchestrator.getAutoApply(),
         });
+        this.post({
+          type: "fastMode",
+          enabled: this.orchestrator.getFastMode(),
+        });
+        this.postScratchpadState();
+        this.postRestoreIfNeeded();
         break;
+      case "editScratchpad":
+        await vscode.commands.executeCommand("blossom.editScratchpad");
+        break;
+      case "openHistory":
+        await vscode.commands.executeCommand("blossom.openChatHistory");
+        break;
+      case "pickImages":
+        await this.handlePickImages();
+        break;
+      case "attachPaths": {
+        const paths = msg.paths ?? [];
+        const attachments: ImageAttachment[] = [];
+        for (const p of paths) {
+          const att = await buildImageAttachment(p);
+          if (att) {
+            attachments.push(att);
+          }
+        }
+        this.post({
+          type: "imageAttachments",
+          items: attachments.map((a) => ({
+            path: a.path,
+            fileName: a.fileName,
+            metadata: a.metadata,
+          })),
+        });
+        break;
+      }
       case "chat": {
+        this.onActivate?.(this);
         const text = (msg.text ?? "").trim();
-        if (!text) {
+        const attachments: ImageAttachment[] = (msg.attachments ?? []).map(
+          (a) => ({
+            path: a.path,
+            fileName: a.fileName,
+            metadata: a.metadata,
+          })
+        );
+        if (!text && attachments.length === 0) {
+          return;
+        }
+        if (!text && attachments.length > 0) {
+          this.post({
+            type: "error",
+            text: "Add a question or description with your image(s).",
+          });
           return;
         }
         this.lastAsk = text;
         this.setTopicFromAsk(text);
         this.post({ type: "assistantStart" });
-        await this.orchestrator.handleUserMessage(text, {
-          onStatus: (s) => this.post({ type: "status", text: s }),
-          onMode: (mode, model, source) =>
-            this.post({ type: "mode", mode, model, source }),
-          onToken: (delta) => this.post({ type: "token", text: delta }),
-          onThought: (thought) => {
-            // Model chain-of-thought goes beside the spinner — never the Prep trail.
-            if ((thought.step || "").toLowerCase() === "model_reasoning") {
-              this.post({ type: "reasoning", text: thought.message });
-              return;
-            }
-            this.post({
-              type: "thought",
-              step: thought.step,
-              message: thought.message,
-            });
-          },
-          onTool: (name, detail) => this.post({ type: "tool", name, detail }),
-          onPendingEdit: (edit) =>
-            this.post({
-              type: "pendingEdit",
-              id: edit.id,
-              path: edit.relativePath,
-              preview:
-                edit.kind === "delete"
-                  ? "(delete this file)"
-                  : edit.newContent.slice(0, 4000),
-              isNew: edit.kind !== "delete" && !edit.oldContent,
-              isDelete: edit.kind === "delete",
-            }),
-          onEditApplied: (id, path) => {
-            this.orchestrator.noteFileApplied(path, true);
-            this.post({ type: "editApplied", id, path, auto: true });
-          },
-          onCodingSummary: (summary) =>
-            this.post({
-              type: "codingSummary",
-              backend: summary.backend,
-              created: summary.created,
-              updated: summary.updated,
-              deleted: summary.deleted ?? [],
-              autoApplied: summary.autoApplied,
-              modelNotes: summary.modelNotes ?? [],
-            }),
-          onDone: (finalText) => {
-            this.post({
-              type: "autoApply",
-              enabled: this.orchestrator.getAutoApply(),
-            });
-            this.post({ type: "assistantDone", text: finalText });
-          },
-          onError: (message) =>
-            this.post({
-              type: "error",
-              text: message,
-              question: this.lastAsk,
-            }),
+        if (attachments.length > 0) {
+          this.post({
+            type: "status",
+            text: `${attachments.length} image(s) attached — checking routing…`,
+          });
+        }
+        this.post({ type: "status", text: "Checking backend…", phaseOnly: true });
+        const health = await checkHealth();
+        this.post({
+          type: "health",
+          ok: health.ok,
+          detail: `${health.detail} · ${new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          })}`,
+          pending: false,
         });
+        if (!health.ok) {
+          // Soft warn — /health can flap while chat still works; don't hard-block.
+          this.post({
+            type: "status",
+            text: `Backend looks down (${health.detail}). Trying the request anyway…`,
+          });
+        }
+        let turnFeedbackId: { id?: string } = {};
+        await this.orchestrator.handleUserMessage(
+          text,
+          this.orchestratorEvents(turnFeedbackId),
+          { imageAttachments: attachments.length ? attachments : undefined }
+        );
+        void this.persistArchive();
         break;
       }
       case "cancel":
         this.orchestrator.cancel();
-        this.post({ type: "status", text: "Cancelled" });
         break;
+      case "deescalateRetry":
+        await this.runDeescalateRetry();
+        break;
+      case "addContext": {
+        const text = (msg.text ?? "").trim();
+        if (!text) {
+          break;
+        }
+        const result = this.orchestrator.addContextInject(text);
+        if (result.ok) {
+          this.post({
+            type: "status",
+            text: "Queued — will apply on the next agent step…",
+            phaseOnly: true,
+          });
+        } else {
+          this.post({
+            type: "contextInjectError",
+            error: result.error || "Could not add context",
+          });
+        }
+        break;
+      }
       case "clear":
         this.orchestrator.cancel();
+        await this.persistArchive();
         this.orchestrator.clearHistory();
         this.clearTopic();
+        this.beginFreshArchive();
         this.post({ type: "cleared" });
         this.post({
           type: "autoApply",
           enabled: this.orchestrator.getAutoApply(),
         });
+        this.post({
+          type: "fastMode",
+          enabled: this.orchestrator.getFastMode(),
+        });
+        this.postScratchpadState();
         break;
       case "applyEdit":
         if (msg.editId) {
@@ -313,31 +876,117 @@ class BlossomChatSession {
           }
         }
         break;
+      case "openEditDiff":
+        if (msg.editId) {
+          const pending =
+            getPendingEdit(msg.editId) || this.editDiffCache.get(msg.editId);
+          if (pending) {
+            try {
+              await openPendingEditDiff(pending);
+            } catch (err) {
+              const m = err instanceof Error ? err.message : String(err);
+              this.post({ type: "error", text: m });
+            }
+          } else {
+            this.post({
+              type: "error",
+              text: "Diff no longer available for this card.",
+            });
+          }
+        }
+        break;
       case "rejectEdit":
         if (msg.editId) {
           await this.orchestrator.rejectEdit(msg.editId);
           this.post({ type: "editRejected", id: msg.editId });
         }
         break;
+      case "resolveCommand": {
+        const id = (msg.commandId ?? "").trim();
+        const raw = (msg.decision ?? "").trim().toLowerCase();
+        const decision =
+          raw === "always" || raw === "allow_always"
+            ? ("always" as const)
+            : raw === "deny" || raw === "reject"
+              ? ("deny" as const)
+              : ("run" as const);
+        if (id) {
+          this.orchestrator.resolveCommand(id, decision);
+        }
+        break;
+      }
+      case "resolveStep": {
+        const id = (msg.stepId ?? "").trim();
+        const raw = (msg.decision ?? "").trim().toLowerCase();
+        const decision =
+          raw === "stop" || raw === "deny" || raw === "reject"
+            ? ("stop" as const)
+            : ("continue" as const);
+        if (id) {
+          this.orchestrator.resolveStep(id, decision);
+        }
+        break;
+      }
       case "setMode":
         break;
-      case "setAutoApply": {
-        this.orchestrator.setAutoApply(!!msg.enabled);
+      case "setFastMode": {
+        this.orchestrator.setFastMode(!!msg.enabled);
+        this.post({
+          type: "fastMode",
+          enabled: this.orchestrator.getFastMode(),
+        });
         this.post({
           type: "autoApply",
           enabled: this.orchestrator.getAutoApply(),
-        });
-        this.post({
-          type: "status",
-          text: msg.enabled
-            ? "Auto-apply on for this session."
-            : "Auto-apply off for this session.",
         });
         break;
       }
       case "checkHealth":
         await this.postHealth({ announce: true });
         break;
+      case "submitFeedback": {
+        const feedbackId = (msg.feedbackId ?? "").trim();
+        const raw = (msg.verdict ?? "").trim().toLowerCase();
+        const verdict =
+          raw === "correct" || raw === "up" || raw === "good" || raw === "👍"
+            ? ("correct" as const)
+            : raw === "incorrect" || raw === "down" || raw === "bad" || raw === "👎"
+              ? ("incorrect" as const)
+              : null;
+        if (!feedbackId || !verdict) {
+          this.post({
+            type: "feedbackResult",
+            feedbackId,
+            ok: false,
+            error: "Missing feedback id or verdict",
+          });
+          break;
+        }
+        const result = await sendCorrectnessFeedback({ feedbackId, verdict });
+        this.post({
+          type: "feedbackResult",
+          feedbackId,
+          ok: result.ok,
+          verdict,
+          error: result.error,
+          detail: result.detail,
+        });
+        if (
+          result.ok &&
+          verdict === "incorrect" &&
+          this.orchestrator.canDeescalate()
+        ) {
+          const choice = await vscode.window.showInformationMessage(
+            "Cloud answer marked incorrect. Retry with local Blossom?",
+            "Retry locally",
+            "Dismiss"
+          );
+          if (choice === "Retry locally") {
+            await this.runDeescalateRetry();
+          }
+        }
+        break;
+      }
       default:
         break;
     }
@@ -443,13 +1092,16 @@ class BlossomChatSession {
     .busy-reasoning {
       flex: 1;
       min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      max-height: 5em;
+      overflow-x: hidden;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
       font-style: italic;
       color: var(--muted);
-      opacity: 0.85;
-      animation: blossom-reason-fade 0.35s ease;
+      opacity: 0.9;
+      line-height: 1.35;
+      font-size: 0.92em;
     }
     @keyframes blossom-reason-fade {
       from { opacity: 0.2; }
@@ -520,6 +1172,29 @@ class BlossomChatSession {
     }
     .msg.user { background: var(--user); }
     .msg.assistant { background: var(--assistant); }
+    .tool {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.85em;
+      line-height: 1.45;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+      background: color-mix(in srgb, var(--fg) 4%, transparent);
+      max-height: 220px;
+      overflow: auto;
+    }
+    .tool .tool-hd {
+      color: color-mix(in srgb, var(--fg) 78%, var(--muted));
+      font-weight: 650;
+      margin-bottom: 2px;
+    }
+    .tool .tool-bd {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     .msg.assistant.rich {
       white-space: normal;
       background: transparent;
@@ -528,6 +1203,51 @@ class BlossomChatSession {
       display: flex;
       flex-direction: column;
       gap: 10px;
+    }
+    .feedback-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 2px;
+      padding: 2px 0;
+    }
+    .feedback-row .fb-label {
+      color: var(--muted);
+      font-size: 0.8em;
+      margin-right: 2px;
+    }
+    .feedback-row button {
+      padding: 2px 8px;
+      font-size: 0.95em;
+      line-height: 1.2;
+      min-width: 2em;
+    }
+    .feedback-row button.active-up {
+      outline: 1px solid var(--accent);
+      background: color-mix(in srgb, var(--accent) 22%, transparent);
+    }
+    .feedback-row button.active-down {
+      outline: 1px solid var(--danger);
+      background: color-mix(in srgb, var(--danger) 18%, transparent);
+    }
+    .feedback-row .fb-status {
+      color: var(--muted);
+      font-size: 0.8em;
+    }
+    .deescalate-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 4px;
+      padding: 2px 0;
+    }
+    .deescalate-row button {
+      font-size: 0.85em;
+      padding: 4px 10px;
+    }
+    .deescalate-row .de-label {
+      color: var(--muted);
+      font-size: 0.8em;
     }
     .msg.system { color: var(--muted); border-style: dashed; font-size: 0.9em; }
     .msg.error { color: var(--danger); }
@@ -722,12 +1442,187 @@ class BlossomChatSession {
       border-radius: 3px;
       background: color-mix(in srgb, var(--fg) 10%, transparent);
     }
-    .tool, .edit, .thoughts, .summary-card {
+    .inline-code {
       font-size: 0.85em;
       background: var(--card);
       border: 1px dashed var(--border);
       border-radius: 8px;
       padding: 8px;
+    }
+    .edit {
+      border-style: solid;
+      border-color: var(--border);
+      padding: 0;
+      overflow: hidden;
+      background: color-mix(in srgb, var(--bg) 55%, var(--card));
+    }
+    .diff-file-hd {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      background: color-mix(in srgb, var(--fg) 5%, var(--card));
+    }
+    .diff-file-icon {
+      width: 14px;
+      height: 14px;
+      border-radius: 3px;
+      flex-shrink: 0;
+      background:
+        linear-gradient(135deg,
+          color-mix(in srgb, var(--accent) 70%, #fff) 0%,
+          var(--accent) 100%);
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 18%, transparent);
+    }
+    .diff-file-name {
+      flex: 1;
+      min-width: 0;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.92em;
+      font-weight: 600;
+      color: color-mix(in srgb, var(--fg) 88%, transparent);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .diff-file-stats {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.8em;
+      font-weight: 650;
+      flex-shrink: 0;
+      letter-spacing: 0.02em;
+    }
+    .diff-file-stats .add { color: #3fb950; }
+    .diff-file-stats .del { color: #f85149; margin-left: 6px; }
+    .diff-file-badge {
+      font-size: 0.72em;
+      font-weight: 650;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: color-mix(in srgb, var(--accent) 85%, var(--fg));
+      border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+      border-radius: 4px;
+      padding: 1px 6px;
+      flex-shrink: 0;
+    }
+    .diff-replace {
+      border-bottom: 1px solid var(--border);
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.8em;
+      line-height: 1.45;
+    }
+    .diff-replace-hd {
+      padding: 6px 10px 2px;
+      font-size: 0.78em;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+    .diff-replace-hd.del { color: #f85149; }
+    .diff-replace-hd.add { color: #3fb950; }
+    .diff-view {
+      max-height: 420px;
+      overflow: auto;
+      margin: 0;
+      background: transparent;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.8em;
+      line-height: 1.45;
+    }
+    .diff-hunk-hd {
+      padding: 4px 10px;
+      color: color-mix(in srgb, var(--fg) 45%, transparent);
+      background: color-mix(in srgb, var(--fg) 4%, transparent);
+      user-select: none;
+      font-size: 0.92em;
+    }
+    .diff-hunk + .diff-hunk {
+      border-top: 1px solid color-mix(in srgb, var(--fg) 10%, transparent);
+    }
+    .diff-line {
+      display: grid;
+      grid-template-columns: 44px 16px minmax(0, 1fr);
+      white-space: pre-wrap;
+      word-break: break-word;
+      min-height: 1.45em;
+    }
+    .diff-line .ln {
+      text-align: right;
+      padding: 0 8px 0 6px;
+      color: color-mix(in srgb, var(--fg) 35%, transparent);
+      user-select: none;
+      font-variant-numeric: tabular-nums;
+    }
+    .diff-line .gutter {
+      text-align: center;
+      user-select: none;
+      opacity: 0.85;
+      font-weight: 600;
+    }
+    .diff-line .body {
+      padding-right: 10px;
+      min-width: 0;
+    }
+    .diff-line.add { background: rgba(46, 160, 67, 0.18); }
+    .diff-line.del { background: rgba(248, 81, 73, 0.16); }
+    .diff-line.ctx { color: color-mix(in srgb, var(--fg) 72%, transparent); }
+    .diff-line.add .gutter { color: #3fb950; }
+    .diff-line.del .gutter { color: #f85149; }
+    .diff-line .ih { border-radius: 2px; }
+    .diff-line.del .ih {
+      background: rgba(248, 81, 73, 0.45);
+      color: color-mix(in srgb, #ffd7d5 40%, var(--fg));
+    }
+    .diff-line.add .ih {
+      background: rgba(46, 160, 67, 0.45);
+      color: color-mix(in srgb, #d4f4d7 35%, var(--fg));
+    }
+    .diff-empty {
+      padding: 10px 12px;
+      color: var(--muted);
+      font-style: italic;
+    }
+    .edit .row { padding: 8px 10px 10px; }
+    .edit .cmd-card-status { padding: 6px 10px 10px; }
+    .cmd-card {
+      border-style: solid;
+      border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+      background: color-mix(in srgb, var(--accent) 8%, var(--card));
+    }
+    .cmd-card.resolved {
+      border-style: dashed;
+      border-color: var(--border);
+      background: var(--card);
+      opacity: 0.92;
+    }
+    .cmd-card.denied {
+      border-color: color-mix(in srgb, #c44 45%, var(--border));
+    }
+    .cmd-card-title {
+      font-weight: 650;
+      margin-bottom: 6px;
+      color: var(--fg);
+    }
+    .cmd-card-cmd {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 0.92em;
+      white-space: pre-wrap;
+      word-break: break-word;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--fg) 6%, transparent);
+      margin: 0 0 6px;
+    }
+    .cmd-card-meta {
+      color: var(--muted);
+      font-size: 0.9em;
+      margin-bottom: 8px;
+    }
+    .cmd-card-status {
+      color: var(--muted);
+      margin-top: 6px;
     }
     .summary-card {
       border-style: solid;
@@ -747,49 +1642,6 @@ class BlossomChatSession {
       margin: 3px 0;
       line-height: 1.35;
     }
-    .thoughts {
-      color: var(--muted);
-      border-style: solid;
-      opacity: 0.95;
-    }
-    .thoughts summary {
-      cursor: pointer;
-      font-weight: 600;
-      color: var(--fg);
-      list-style: none;
-    }
-    .thoughts summary::-webkit-details-marker { display: none; }
-    .thoughts ol {
-      margin: 8px 0 0;
-      padding-left: 1.2em;
-    }
-    .thoughts li {
-      margin: 3px 0;
-      line-height: 1.35;
-    }
-    .thoughts .step {
-      font-family: var(--vscode-editor-font-family, monospace);
-      opacity: 0.75;
-      margin-right: 6px;
-    }
-    .thoughts li.reasoning-entry {
-      margin: 8px 0 6px;
-    }
-    .thoughts .reasoning-body {
-      white-space: pre-wrap;
-      word-break: break-word;
-      display: block;
-      margin-top: 4px;
-      padding: 6px 8px;
-      border-left: 2px solid color-mix(in srgb, var(--accent) 55%, var(--border));
-      background: color-mix(in srgb, var(--fg) 5%, var(--card));
-      border-radius: 0 4px 4px 0;
-      font-size: 0.88em;
-      line-height: 1.45;
-      opacity: 0.92;
-      max-height: 240px;
-      overflow: auto;
-    }
     .edit pre {
       max-height: 160px;
       overflow: auto;
@@ -805,16 +1657,89 @@ class BlossomChatSession {
       border-top: 1px solid var(--border);
       padding-top: 8px;
     }
-    textarea {
-      width: 100%;
-      min-height: 88px;
-      resize: vertical;
+    .attach-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      min-height: 0;
+    }
+    .attach-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 0.82em;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--chip-bg, rgba(127,127,127,0.15));
+      border: 1px solid var(--border);
+      max-width: 100%;
+    }
+    .attach-chip button {
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      padding: 0 2px;
+      font-size: 1em;
+      line-height: 1;
+      opacity: 0.7;
+    }
+    .attach-chip button:hover { opacity: 1; }
+    .msg.user.context-inject {
+      border-left: 3px solid var(--vscode-textLink-foreground, #3794ff);
+      opacity: 0.95;
+    }
+    .context-inject-label {
+      font-size: 0.78em;
+      font-weight: 600;
+      opacity: 0.75;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .context-inject-body {
+      white-space: pre-wrap;
+    }
+    .composer-box {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
       background: var(--input-bg);
       color: var(--input-fg);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 8px;
+      overflow: hidden;
+    }
+    .composer-box:focus-within {
+      outline: 1px solid var(--vscode-focusBorder, var(--accent));
+    }
+    textarea {
+      width: 100%;
+      min-height: 88px;
+      resize: vertical;
+      background: transparent;
+      color: inherit;
+      border: none;
+      border-radius: 0;
+      padding: 8px 8px 4px;
       font: inherit;
+      outline: none;
+    }
+    .composer-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      padding: 4px 6px 6px;
+      border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    }
+    .composer-actions .spacer {
+      flex: 1;
+      min-width: 4px;
+    }
+    .composer-actions button {
+      font-size: 0.9em;
+      padding: 3px 9px;
     }
     .dot {
       width: 8px; height: 8px; border-radius: 50%;
@@ -834,9 +1759,10 @@ class BlossomChatSession {
     <div class="meta" id="health"><span class="dot" id="healthDot"></span><span id="healthText">Checking backend…</span></div>
     <div class="meta" id="modeLine">Coding assistant</div>
     <div class="row">
-      <button class="chip" id="btnAutoApply" title="Write proposed edits to disk without asking (this chat only)">Auto-apply</button>
-      <button id="btnHealth" title="Recheck ChatRouter / Ollama">Ping</button>
-      <button id="btnClear" title="Clear conversation">Clear</button>
+      <button class="chip" id="btnScratchpad" title="Workspace working notes injected into each coding turn">Scratchpad</button>
+      <button class="chip" id="btnHistory" title="Open a previously saved Blossom chat">History</button>
+      <button id="btnHealth" title="Recheck Blossom / Ollama">Ping</button>
+      <button id="btnClear" title="Clear conversation (current chat stays in History)">Clear</button>
       <button id="btnCancel">Stop</button>
     </div>
   </header>
@@ -845,15 +1771,21 @@ class BlossomChatSession {
       <div class="spinner" id="busySpinner" title="Working…"></div>
       <span id="busyLabel">Working…</span>
       <div id="busyReasoningWrap" class="busy-reasoning-wrap" aria-live="polite">
-        <span class="busy-reasoning-label">Reasoning</span>
+        <span class="busy-reasoning-label">Blossom Thinking</span>
         <span id="busyReasoning" class="busy-reasoning"></span>
       </div>
     </div>
   </div>
   <div class="composer">
-    <textarea id="input" placeholder="Ask your coding assistant…"></textarea>
-    <div class="row">
-      <button class="primary" id="btnSend">Send</button>
+    <div class="attach-row" id="attachRow" hidden></div>
+    <div class="composer-box">
+      <textarea id="input" placeholder="Ask your coding assistant…"></textarea>
+      <div class="composer-actions">
+        <button class="chip" id="btnFastMode" title="Fast mode: auto-run shell commands and auto-apply edits. Click again to turn off.">Fast</button>
+        <div class="spacer"></div>
+        <button id="btnAttach" title="Attach PNG/JPEG/WebP/GIF (vision → Cursor escalate)">Attach image</button>
+        <button class="primary" id="btnSend">Send</button>
+      </div>
     </div>
   </div>
   <script nonce="${nonce}">
@@ -864,24 +1796,86 @@ class BlossomChatSession {
     const healthText = document.getElementById('healthText');
     const modeLine = document.getElementById('modeLine');
     let streamingEl = null;
-    let thoughtsEl = null;
-    let thoughtsList = null;
-    let reasoningLines = [];
-    let reasoningLineIdx = 0;
-    let reasoningTimer = null;
-    let reasoningPlaying = false;
+    let reasoningText = '';
     let reasoningDoneTimer = null;
     let lastAsk = '';
     let busy = false;
+    let pendingAttachments = [];
+
+    function renderAttachmentChips() {
+      const row = document.getElementById('attachRow');
+      if (!row) return;
+      row.innerHTML = '';
+      if (!pendingAttachments.length) {
+        row.hidden = true;
+        return;
+      }
+      row.hidden = false;
+      for (let i = 0; i < pendingAttachments.length; i++) {
+        const a = pendingAttachments[i];
+        const chip = document.createElement('span');
+        chip.className = 'attach-chip';
+        chip.title = a.metadata || a.path || '';
+        const label = document.createElement('span');
+        label.textContent = '🖼 ' + (a.fileName || 'image');
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.textContent = '×';
+        rm.title = 'Remove';
+        rm.onclick = () => {
+          pendingAttachments.splice(i, 1);
+          renderAttachmentChips();
+        };
+        chip.appendChild(label);
+        chip.appendChild(rm);
+        row.appendChild(chip);
+      }
+    }
+
+    function appendContextInject(text) {
+      const el = document.createElement('div');
+      el.className = 'msg user context-inject';
+      const label = document.createElement('div');
+      label.className = 'context-inject-label';
+      label.textContent = 'Context added';
+      const body = document.createElement('div');
+      body.className = 'context-inject-body';
+      const t = String(text || '').trim();
+      body.textContent = t.length > 280 ? (t.slice(0, 277) + '…') : t;
+      body.title = t;
+      el.appendChild(label);
+      el.appendChild(body);
+      messagesEl.appendChild(el);
+      pinBusyToBottom();
+    }
 
     function sendText(text, opts) {
       const ask = (text || '').trim();
-      if (!ask || busy) return;
+      if (!ask) return;
+      if (busy && !(opts && opts.retry)) {
+        appendContextInject(ask);
+        input.value = '';
+        vscode.postMessage({ type: 'addContext', text: ask });
+        return;
+      }
+      if ((!ask && !pendingAttachments.length) || busy) return;
+      if (!ask && pendingAttachments.length) {
+        append('assistant', 'Add a question or description with your image(s).');
+        return;
+      }
       const isRetry = opts && opts.retry;
+      const attachments = pendingAttachments.slice();
       lastAsk = ask;
       if (!isRetry) {
-        append('user', ask);
+        let userBody = ask;
+        if (attachments.length) {
+          userBody += '\\n\\n[' + attachments.length + ' image(s): ' +
+            attachments.map((a) => a.fileName).join(', ') + ']';
+        }
+        append('user', userBody);
         input.value = '';
+        pendingAttachments = [];
+        renderAttachmentChips();
       } else {
         const note = document.createElement('div');
         note.className = 'tool';
@@ -890,8 +1884,9 @@ class BlossomChatSession {
         pinBusyToBottom();
       }
       setBusy(true);
+      setBusyLabel(isRetry ? 'Retrying…' : 'Working…');
       streamingEl = null;
-      vscode.postMessage({ type: 'chat', text: ask });
+      vscode.postMessage({ type: 'chat', text: ask, attachments: attachments });
     }
 
     function showErrorCard(errorText, question) {
@@ -948,44 +1943,6 @@ class BlossomChatSession {
         .trim();
     }
 
-    /** Break reasoning into one-sentence chunks for the spinner ticker. */
-    function splitReasoningLines(text) {
-      const raw = cleanReasoningText(text);
-      if (!raw) return [];
-      const chunks = [];
-      const pushSentences = (block) => {
-        const b = (block || '').trim();
-        if (!b) return;
-        const re = /[^.!?]+(?:[.!?]+["']?|\\s*$)/g;
-        let m;
-        let matched = false;
-        while ((m = re.exec(b))) {
-          const s = m[0].replace(/\\s+/g, ' ').trim();
-          if (s) {
-            chunks.push(s);
-            matched = true;
-          }
-        }
-        if (!matched) chunks.push(b.replace(/\\s+/g, ' ').trim());
-      };
-      const paragraphs = raw.split(/\\r?\\n+/).map((l) => l.trim()).filter(Boolean);
-      if (paragraphs.length > 1) {
-        for (const p of paragraphs) pushSentences(p);
-      } else {
-        pushSentences(raw);
-      }
-      const out = [];
-      for (const s of chunks) {
-        if (!s) continue;
-        if (out.length && s.length < 12 && !/[.!?]$/.test(s)) {
-          out[out.length - 1] = out[out.length - 1] + ' ' + s;
-        } else {
-          out.push(s);
-        }
-      }
-      return out.length > 0 ? out : [raw.replace(/\\s+/g, ' ').trim()];
-    }
-
     function ensureBusyRowVisible() {
       const row = document.getElementById('busyRow');
       if (!row) return;
@@ -994,37 +1951,30 @@ class BlossomChatSession {
       pinBusyToBottom();
     }
 
-    function showReasoningLine() {
+    /** Live model reasoning beside the busy spinner (streamed, not stepped). */
+    function setReasoningTicker(text) {
+      if (!busy) return;
+      const cleaned = cleanReasoningText(text);
+      if (!cleaned) return;
+      reasoningText = cleaned;
       const wrap = document.getElementById('busyReasoningWrap');
       const el = document.getElementById('busyReasoning');
       const label = document.getElementById('busyLabel');
       if (!wrap || !el) return;
-      if (reasoningLines.length === 0) {
-        wrap.classList.remove('on');
-        el.textContent = '';
-        el.removeAttribute('title');
-        if (label) label.style.display = '';
-        return;
-      }
       ensureBusyRowVisible();
       wrap.classList.add('on');
       if (label) label.style.display = 'none';
-      const idx = Math.min(reasoningLineIdx, reasoningLines.length - 1);
-      // retrigger fade animation
-      el.style.animation = 'none';
-      void el.offsetWidth;
-      el.style.animation = '';
-      el.textContent = reasoningLines[idx];
-      el.title = reasoningLines[idx];
+      el.textContent = reasoningText;
+      el.title = reasoningText;
+      el.scrollTop = el.scrollHeight;
+      pinBusyToBottom();
     }
 
     function finishReasoningTicker() {
-      stopReasoningTicker();
       if (reasoningDoneTimer) {
         clearTimeout(reasoningDoneTimer);
         reasoningDoneTimer = null;
       }
-      reasoningPlaying = false;
       const wrap = document.getElementById('busyReasoningWrap');
       const el = document.getElementById('busyReasoning');
       const label = document.getElementById('busyLabel');
@@ -1040,8 +1990,7 @@ class BlossomChatSession {
         label.textContent = 'Working…';
       }
       if (spinner) spinner.style.display = '';
-      reasoningLines = [];
-      reasoningLineIdx = 0;
+      reasoningText = '';
       if (row && !busy) {
         row.classList.remove('on');
         row.setAttribute('aria-hidden', 'true');
@@ -1049,8 +1998,6 @@ class BlossomChatSession {
     }
 
     function completeReasoningTicker() {
-      // Turn finished — don't drain remaining sentences; flash Done then hide.
-      stopReasoningTicker();
       if (reasoningDoneTimer) {
         clearTimeout(reasoningDoneTimer);
         reasoningDoneTimer = null;
@@ -1060,10 +2007,8 @@ class BlossomChatSession {
       const label = document.getElementById('busyLabel');
       const row = document.getElementById('busyRow');
       const spinner = document.getElementById('busySpinner');
-      const hadReasoning = reasoningPlaying || reasoningLines.length > 0;
-      reasoningPlaying = false;
-      reasoningLines = [];
-      reasoningLineIdx = 0;
+      const hadReasoning = Boolean(reasoningText);
+      reasoningText = '';
       if (!hadReasoning) {
         if (row && !busy) {
           row.classList.remove('on');
@@ -1079,9 +2024,6 @@ class BlossomChatSession {
       if (label) label.style.display = 'none';
       if (wrap && el) {
         wrap.classList.add('on');
-        el.style.animation = 'none';
-        void el.offsetWidth;
-        el.style.animation = '';
         el.textContent = 'Done';
         el.title = 'Done';
         el.style.fontStyle = 'normal';
@@ -1098,41 +2040,12 @@ class BlossomChatSession {
       }, 900);
     }
 
-    function startReasoningTicker() {
-      if (reasoningTimer) return;
-      if (!busy) return; // don't keep rotating after the turn finished
-      reasoningPlaying = true;
-      reasoningTimer = setInterval(() => {
-        if (!busy) {
-          completeReasoningTicker();
-          return;
-        }
-        if (reasoningLineIdx < reasoningLines.length - 1) {
-          reasoningLineIdx += 1;
-          showReasoningLine();
-          return;
-        }
-        // On last sentence while still busy — hold it; Done comes when turn ends.
-        stopReasoningTicker();
-      }, 5000);
-    }
-
-    function stopReasoningTicker() {
-      if (reasoningTimer) {
-        clearInterval(reasoningTimer);
-        reasoningTimer = null;
-      }
-    }
-
     function resetReasoningTicker() {
-      stopReasoningTicker();
       if (reasoningDoneTimer) {
         clearTimeout(reasoningDoneTimer);
         reasoningDoneTimer = null;
       }
-      reasoningPlaying = false;
-      reasoningLines = [];
-      reasoningLineIdx = 0;
+      reasoningText = '';
       const wrap = document.getElementById('busyReasoningWrap');
       const el = document.getElementById('busyReasoning');
       const label = document.getElementById('busyLabel');
@@ -1149,70 +2062,6 @@ class BlossomChatSession {
         label.textContent = 'Working…';
       }
       if (spinner) spinner.style.display = '';
-    }
-
-    function setReasoningTicker(text) {
-      if (!busy) return; // ignore late reasoning after the turn is done
-      const lines = splitReasoningLines(text);
-      if (lines.length === 0) {
-        return;
-      }
-      const prevLen = reasoningLines.length;
-      reasoningLines = lines;
-      if (prevLen === 0) {
-        reasoningLineIdx = 0;
-        showReasoningLine();
-        startReasoningTicker();
-      } else {
-        if (reasoningLineIdx >= reasoningLines.length) {
-          reasoningLineIdx = reasoningLines.length - 1;
-        }
-        showReasoningLine();
-        startReasoningTicker();
-      }
-    }
-
-    function ensureThoughts() {
-      if (thoughtsEl) return;
-      thoughtsEl = document.createElement('details');
-      thoughtsEl.className = 'thoughts';
-      thoughtsEl.open = true;
-      const sum = document.createElement('summary');
-      sum.textContent = 'Thinking…';
-      thoughtsList = document.createElement('ol');
-      thoughtsEl.appendChild(sum);
-      thoughtsEl.appendChild(thoughtsList);
-      messagesEl.appendChild(thoughtsEl);
-      pinBusyToBottom();
-    }
-
-    function addThought(step, message, local) {
-      const stepKey = String(step || '').toLowerCase();
-      // Never dump model reasoning into Prep — spinner ticker only.
-      if (
-        stepKey === 'model_reasoning' ||
-        /^(?:thought\\s+)?step\\s*=\\s*model_reasoning\\b/i.test(String(message || ''))
-      ) {
-        setReasoningTicker(message);
-        pinBusyToBottom();
-        return;
-      }
-      ensureThoughts();
-      const li = document.createElement('li');
-      if (step) {
-        const s = document.createElement('span');
-        s.className = 'step';
-        s.textContent = local ? '[' + step + ']' : step;
-        li.appendChild(s);
-      }
-      const body = document.createElement('span');
-      body.textContent = message;
-      li.appendChild(body);
-      thoughtsList.appendChild(li);
-      const sum = thoughtsEl.querySelector('summary');
-      const n = thoughtsList.children.length;
-      sum.textContent = local ? ('Prep · ' + n + ' step' + (n === 1 ? '' : 's')) : ('Thinking · ' + n + ' step' + (n === 1 ? '' : 's'));
-      pinBusyToBottom();
     }
 
     function pinBusyToBottom() {
@@ -1404,9 +2253,26 @@ class BlossomChatSession {
           lang = t;
           break;
         }
+        // Shell tool requests are approval cards — never show as Code boxes.
+        if (/^tool_call$/i.test(lang)) {
+          last = m.index + m[0].length;
+          continue;
+        }
+        let filePath = pathM ? pathM[1].replace(/\\\\/g, '/') : '';
+        // Filename-as-lang style (e.g. blog.php) — treat as path
+        if (!filePath && lang && /\\.[\\w]{1,8}$/.test(lang) && !/[=:]/.test(lang)) {
+          filePath = lang;
+          lang = '';
+        }
+        // Path-labeled full-file dumps become diff cards — show path, skip body.
+        if (filePath && /\\b(?:path|file)\\s*[=:]/i.test(info) && !/\\b(?:delete|remove)\\b/i.test(info)) {
+          blocks.push({ type: 'prose', body: '**Edit:** \`' + filePath + '\`' });
+          last = m.index + m[0].length;
+          continue;
+        }
         blocks.push({
           type: 'code',
-          path: pathM ? pathM[1].replace(/\\\\/g, '/') : '',
+          path: filePath,
           lang,
           content: (m[2] || '').replace(/\\n$/, ''),
         });
@@ -1498,15 +2364,109 @@ class BlossomChatSession {
       }
     }
 
+    function attachFeedback(afterEl, feedbackId) {
+      if (!feedbackId || !afterEl) return;
+      const row = document.createElement('div');
+      row.className = 'feedback-row';
+      row.dataset.feedbackId = feedbackId;
+      const label = document.createElement('span');
+      label.className = 'fb-label';
+      label.textContent = 'Was this helpful?';
+      const up = document.createElement('button');
+      up.type = 'button';
+      up.title = 'Correct';
+      up.setAttribute('aria-label', 'Thumbs up');
+      up.textContent = '👍';
+      const down = document.createElement('button');
+      down.type = 'button';
+      down.title = 'Incorrect';
+      down.setAttribute('aria-label', 'Thumbs down');
+      down.textContent = '👎';
+      const status = document.createElement('span');
+      status.className = 'fb-status';
+      const lock = (verdict) => {
+        up.disabled = true;
+        down.disabled = true;
+        if (verdict === 'correct') up.classList.add('active-up');
+        if (verdict === 'incorrect') down.classList.add('active-down');
+      };
+      up.onclick = () => {
+        lock('correct');
+        status.textContent = 'Sending…';
+        vscode.postMessage({ type: 'submitFeedback', feedbackId: feedbackId, verdict: 'correct' });
+      };
+      down.onclick = () => {
+        lock('incorrect');
+        status.textContent = 'Sending…';
+        vscode.postMessage({ type: 'submitFeedback', feedbackId: feedbackId, verdict: 'incorrect' });
+      };
+      row.appendChild(label);
+      row.appendChild(up);
+      row.appendChild(down);
+      row.appendChild(status);
+      afterEl.insertAdjacentElement('afterend', row);
+    }
+
+    function attachDeescalate(afterEl) {
+      if (!afterEl) return;
+      const row = document.createElement('div');
+      row.className = 'deescalate-row';
+      const label = document.createElement('span');
+      label.className = 'de-label';
+      label.textContent = 'Cloud answer not enough?';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = 'Retry with local Blossom';
+      btn.title = 'Re-run local Blossom using the cloud answer as read-only reference';
+      btn.onclick = () => {
+        btn.disabled = true;
+        row.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        vscode.postMessage({ type: 'deescalateRetry' });
+      };
+      row.appendChild(label);
+      row.appendChild(btn);
+      afterEl.insertAdjacentElement('afterend', row);
+    }
+
+    function setBusyLabel(text) {
+      const label = document.getElementById('busyLabel');
+      const wrap = document.getElementById('busyReasoningWrap');
+      if (!label) return;
+      const t = String(text || '').trim();
+      if (!t) return;
+      const short = t.length > 90 ? (t.slice(0, 89) + '…') : t;
+      label.textContent = short;
+      label.title = t;
+      // Reasoning ticker owns the row when active; keep label text ready underneath.
+      if (!wrap || !wrap.classList.contains('on')) {
+        label.style.display = '';
+      }
+    }
+
     function setBusy(v) {
       busy = v;
-      document.getElementById('btnSend').disabled = v;
+      const sendBtn = document.getElementById('btnSend');
+      if (sendBtn) {
+        sendBtn.disabled = false;
+        sendBtn.textContent = v ? 'Add context' : 'Send';
+        sendBtn.title = v
+          ? 'Add context for the current task (does not stop the agent)'
+          : 'Send message';
+      }
+      const attachBtn = document.getElementById('btnAttach');
+      if (attachBtn) attachBtn.disabled = v;
+      if (input) {
+        input.placeholder = v
+          ? 'Add context for the current task…'
+          : 'Ask your coding assistant…';
+      }
       const row = document.getElementById('busyRow');
       if (row) {
         if (v) {
           row.classList.add('on');
           row.setAttribute('aria-hidden', 'false');
-        } else if (reasoningPlaying || reasoningLines.length > 0) {
+          setBusyLabel('Working…');
+        } else if (reasoningText) {
           // Skip remaining flavor sentences — flash Done then hide.
           completeReasoningTicker();
         } else {
@@ -1522,6 +2482,9 @@ class BlossomChatSession {
       sendText(input.value, { retry: false });
     }
 
+    document.getElementById('btnAttach').addEventListener('click', () => {
+      vscode.postMessage({ type: 'pickImages' });
+    });
     document.getElementById('btnSend').addEventListener('click', send);
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -1538,11 +2501,38 @@ class BlossomChatSession {
     document.getElementById('btnHealth').addEventListener('click', () => {
       vscode.postMessage({ type: 'checkHealth' });
     });
-    document.getElementById('btnAutoApply').addEventListener('click', () => {
-      const btn = document.getElementById('btnAutoApply');
+    document.getElementById('btnFastMode').addEventListener('click', () => {
+      const btn = document.getElementById('btnFastMode');
       const next = !btn.classList.contains('active');
-      vscode.postMessage({ type: 'setAutoApply', enabled: next });
+      vscode.postMessage({ type: 'setFastMode', enabled: next });
     });
+    const btnScratchpad = document.getElementById('btnScratchpad');
+    if (btnScratchpad) {
+      btnScratchpad.addEventListener('click', () => {
+        vscode.postMessage({ type: 'editScratchpad' });
+      });
+    }
+    const btnHistory = document.getElementById('btnHistory');
+    if (btnHistory) {
+      btnHistory.addEventListener('click', () => {
+        vscode.postMessage({ type: 'openHistory' });
+      });
+    }
+
+    function wipeMessages() {
+      pendingAttachments = [];
+      renderAttachmentChips();
+      messagesEl.innerHTML = '';
+      lastAsk = '';
+      resetReasoningTicker();
+      streamingEl = null;
+      const row = document.createElement('div');
+      row.className = 'busy-row';
+      row.id = 'busyRow';
+      row.setAttribute('aria-hidden', 'true');
+      row.innerHTML = '<div class="spinner" id="busySpinner" title="Working…"></div><span id="busyLabel">Working…</span><div id="busyReasoningWrap" class="busy-reasoning-wrap" aria-live="polite"><span class="busy-reasoning-label">Blossom Thinking</span><span id="busyReasoning" class="busy-reasoning"></span></div>';
+      messagesEl.appendChild(row);
+    }
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
@@ -1558,54 +2548,202 @@ class BlossomChatSession {
             ? ('Coding · ' + msg.model + ' · ' + msg.source)
             : ('Coding · ' + msg.model);
           break;
-        case 'autoApply': {
-          const btn = document.getElementById('btnAutoApply');
-          if (msg.enabled) btn.classList.add('active');
-          else btn.classList.remove('active');
+        case 'autoApply':
           break;
-        }
-        case 'status':
-          if (msg.text) {
-            addThought('local', msg.text, true);
+        case 'fastMode': {
+          const btn = document.getElementById('btnFastMode');
+          if (!btn) break;
+          if (msg.enabled) {
+            btn.classList.add('active');
+            btn.textContent = 'Fast on';
+            btn.title = 'Fast mode on — commands auto-run and edits auto-apply. Click to turn off.';
+          } else {
+            btn.classList.remove('active');
+            btn.textContent = 'Fast';
+            btn.title = 'Fast mode: auto-run shell commands and auto-apply edits. Click again to turn off.';
           }
           break;
+        }
+        case 'scratchpad':
+          break;
         case 'assistantStart':
-          thoughtsEl = null;
-          thoughtsList = null;
           resetReasoningTicker();
           streamingEl = null;
+          setBusyLabel('Starting…');
           break;
+        case 'status': {
+          const t = (msg.text || '').trim();
+          if (t) setBusyLabel(t);
+          break;
+        }
         case 'reasoning':
           setReasoningTicker(msg.text || '');
           pinBusyToBottom();
           break;
         case 'thought':
-          addThought(msg.step || '', msg.message || '', false);
+          // Legacy trail box removed — ignore pipeline thought steps entirely.
           break;
         case 'token':
           // Do NOT clear the reasoning ticker here — ChatRouter often emits
           // model_reasoning immediately before answer tokens, so wiping on
           // first token made the ticker invisible. Keep sentences rotating.
-          if (thoughtsEl && thoughtsEl.open) {
-            // collapse trail once answer starts flowing
-            thoughtsEl.open = false;
-            const sum = thoughtsEl.querySelector('summary');
-            if (sum && thoughtsList) {
-              sum.textContent = 'Thoughts · ' + thoughtsList.children.length;
-            }
-          }
           if (!streamingEl) streamingEl = append('assistant', '');
           streamingEl.textContent += msg.text;
+          pinBusyToBottom();
+          break;
+        case 'streamBreak':
+          // Seal the current assistant bubble so Apply / ✓ cards sit between
+          // segments; the next token opens a new bubble.
+          if (streamingEl) {
+            const body = streamingEl.textContent || '';
+            if (body.trim()) {
+              renderAssistant(streamingEl, body);
+            } else {
+              streamingEl.remove();
+            }
+            streamingEl = null;
+          }
           pinBusyToBottom();
           break;
         case 'tool': {
           const t = document.createElement('div');
           t.className = 'tool';
-          t.textContent = (msg.name === 'editor_context' ? 'Attached ' : 'Tool · ') +
-            (msg.name === 'editor_context' ? msg.detail : (msg.name + (msg.detail ? '\\n' + msg.detail : '')));
-          messagesEl.appendChild(t);
+          const hd = document.createElement('div');
+          hd.className = 'tool-hd';
+          const bd = document.createElement('div');
+          bd.className = 'tool-bd';
           if (msg.name === 'editor_context') {
-            addThought('local', 'Attached ' + msg.detail, true);
+            hd.textContent = 'Attached';
+            bd.textContent = msg.detail || '';
+          } else if (msg.name === 'run_command') {
+            hd.textContent = 'Command';
+            bd.textContent = msg.detail || '';
+          } else {
+            hd.textContent = 'Tool · ' + msg.name;
+            bd.textContent = msg.detail || '';
+          }
+          t.appendChild(hd);
+          if ((bd.textContent || '').trim()) t.appendChild(bd);
+          messagesEl.appendChild(t);
+          setBusyLabel(msg.name === 'editor_context'
+            ? ('Attached ' + msg.detail)
+            : (msg.name === 'run_command' ? 'Running command…' : ('Running ' + msg.name + '…')));
+          pinBusyToBottom();
+          break;
+        }
+        case 'pendingCommand': {
+          const wrap = document.createElement('div');
+          wrap.className = 'cmd-card';
+          wrap.dataset.commandId = msg.id;
+          const title = document.createElement('div');
+          title.className = 'cmd-card-title';
+          title.textContent = 'Run this command?';
+          const pre = document.createElement('div');
+          pre.className = 'cmd-card-cmd';
+          pre.textContent = '$ ' + (msg.command || '');
+          wrap.appendChild(title);
+          wrap.appendChild(pre);
+          if (msg.cwd && msg.cwd !== '.') {
+            const meta = document.createElement('div');
+            meta.className = 'cmd-card-meta';
+            meta.textContent = 'in ' + msg.cwd + (msg.root ? ' (' + msg.root + ')' : '');
+            wrap.appendChild(meta);
+          }
+          const row = document.createElement('div');
+          row.className = 'row';
+          const run = document.createElement('button');
+          run.className = 'primary';
+          run.textContent = 'Run';
+          run.title = 'Run this command once';
+          const always = document.createElement('button');
+          always.textContent = 'Always allow';
+          always.title = 'Whitelist this command type (first word) and run';
+          const deny = document.createElement('button');
+          deny.textContent = 'Deny';
+          deny.title = 'Do not run this command';
+          const lock = (decision) => {
+            run.disabled = true;
+            always.disabled = true;
+            deny.disabled = true;
+            vscode.postMessage({ type: 'resolveCommand', commandId: msg.id, decision: decision });
+          };
+          run.onclick = () => lock('run');
+          always.onclick = () => lock('always');
+          deny.onclick = () => lock('deny');
+          row.appendChild(run);
+          row.appendChild(always);
+          row.appendChild(deny);
+          wrap.appendChild(row);
+          messagesEl.appendChild(wrap);
+          setBusyLabel('Waiting for your OK to run the command…');
+          pinBusyToBottom();
+          break;
+        }
+        case 'pendingStep': {
+          const wrap = document.createElement('div');
+          wrap.className = 'cmd-card';
+          wrap.dataset.stepId = msg.id;
+          const title = document.createElement('div');
+          title.className = 'cmd-card-title';
+          title.textContent = msg.reason || 'Continue to the next step?';
+          wrap.appendChild(title);
+          if (msg.detail) {
+            const meta = document.createElement('div');
+            meta.className = 'cmd-card-meta';
+            meta.textContent = msg.detail;
+            wrap.appendChild(meta);
+          }
+          const row = document.createElement('div');
+          row.className = 'row';
+          const cont = document.createElement('button');
+          cont.className = 'primary';
+          cont.textContent = 'Continue';
+          cont.title = 'Continue the agent loop';
+          const stop = document.createElement('button');
+          stop.textContent = 'Stop';
+          stop.title = 'Stop here and finish with current results';
+          const lock = (decision) => {
+            cont.disabled = true;
+            stop.disabled = true;
+            vscode.postMessage({ type: 'resolveStep', stepId: msg.id, decision: decision });
+          };
+          cont.onclick = () => lock('continue');
+          stop.onclick = () => lock('stop');
+          row.appendChild(cont);
+          row.appendChild(stop);
+          wrap.appendChild(row);
+          messagesEl.appendChild(wrap);
+          setBusyLabel('Waiting for Continue / Stop…');
+          pinBusyToBottom();
+          break;
+        }
+        case 'stepResolved': {
+          const el = document.querySelector('[data-step-id="' + msg.id + '"]');
+          if (el) {
+            el.classList.add('resolved');
+            const meta = document.createElement('div');
+            meta.className = 'cmd-card-meta';
+            meta.textContent = msg.detail || msg.decision || '';
+            el.appendChild(meta);
+          }
+          break;
+        }
+        case 'commandResolved': {
+          const el = document.querySelector('[data-command-id="' + msg.id + '"]');
+          if (el) {
+            el.classList.add('resolved');
+            if (msg.decision === 'deny') el.classList.add('denied');
+            el.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+            let st = el.querySelector('.cmd-card-status');
+            if (!st) {
+              st = document.createElement('div');
+              st.className = 'cmd-card-status';
+              el.appendChild(st);
+            }
+            st.textContent = msg.detail || (msg.decision === 'deny' ? 'Denied' : 'Approved');
+          }
+          if (msg.decision !== 'deny') {
+            setBusyLabel(msg.detail || 'Running command…');
           }
           pinBusyToBottom();
           break;
@@ -1614,29 +2752,213 @@ class BlossomChatSession {
           const wrap = document.createElement('div');
           wrap.className = 'edit';
           wrap.dataset.editId = msg.id;
-          const title = document.createElement('div');
-          title.textContent = msg.isDelete
-            ? ("Delete: " + msg.path)
-            : ((msg.isNew ? "New file: " : "Edit: ") + msg.path);
-          const pre = document.createElement('pre');
-          pre.textContent = msg.isDelete
-            ? '(will remove from disk)'
-            : (msg.preview + (msg.preview && msg.preview.length >= 4000 ? '\\n…' : ''));
+
+          const diff = msg.diff || {};
+          const additions = diff.additions || 0;
+          const deletions = diff.deletions || 0;
+          const isReplace = msg.source === 'search_replace';
+
+          const hd = document.createElement('div');
+          hd.className = 'diff-file-hd';
+          const icon = document.createElement('span');
+          icon.className = 'diff-file-icon';
+          icon.setAttribute('aria-hidden', 'true');
+          const name = document.createElement('span');
+          name.className = 'diff-file-name';
+          name.textContent = msg.path || 'file';
+          name.title = msg.isDelete
+            ? ('Delete ' + msg.path)
+            : (msg.isNew ? ('New file ' + msg.path) : (isReplace ? ('Replace in ' + msg.path) : ('Update ' + msg.path)));
+          if (isReplace) {
+            const badge = document.createElement('span');
+            badge.className = 'diff-file-badge';
+            badge.textContent = 'replace';
+            hd.appendChild(icon);
+            hd.appendChild(name);
+            hd.appendChild(badge);
+          } else {
+            hd.appendChild(icon);
+            hd.appendChild(name);
+          }
+          const stats = document.createElement('span');
+          stats.className = 'diff-file-stats';
+          if (msg.isDelete) {
+            stats.innerHTML = '<span class="del">−' + deletions + '</span>';
+          } else if (msg.isNew) {
+            stats.innerHTML = '<span class="add">+' + additions + '</span>';
+          } else {
+            stats.innerHTML = '<span class="add">+' + additions + '</span><span class="del">−' + deletions + '</span>';
+          }
+          hd.appendChild(stats);
+          wrap.appendChild(hd);
+
+          const appendSegments = (parent, line) => {
+            const body = document.createElement('span');
+            body.className = 'body';
+            const segs = Array.isArray(line.segments) ? line.segments : null;
+            if (segs && segs.length) {
+              for (const seg of segs) {
+                if (seg.highlight) {
+                  const mark = document.createElement('span');
+                  mark.className = 'ih';
+                  mark.textContent = seg.text == null ? '' : String(seg.text);
+                  body.appendChild(mark);
+                } else {
+                  body.appendChild(document.createTextNode(seg.text == null ? '' : String(seg.text)));
+                }
+              }
+            } else {
+              body.textContent = line.text == null ? '' : String(line.text);
+            }
+            parent.appendChild(body);
+          };
+
+          const appendPlainLines = (parent, text, kind) => {
+            const lines = String(text || '').replace(/\\r\\n/g, '\\n').split('\\n');
+            const max = 80;
+            const shown = lines.slice(0, max);
+            for (const lineText of shown) {
+              const row = document.createElement('div');
+              row.className = 'diff-line ' + kind;
+              const ln = document.createElement('span');
+              ln.className = 'ln';
+              const gutter = document.createElement('span');
+              gutter.className = 'gutter';
+              gutter.textContent = kind === 'add' ? '+' : '−';
+              const body = document.createElement('span');
+              body.className = 'body';
+              body.textContent = lineText;
+              row.appendChild(ln);
+              row.appendChild(gutter);
+              row.appendChild(body);
+              parent.appendChild(row);
+            }
+            if (lines.length > max) {
+              const more = document.createElement('div');
+              more.className = 'diff-empty';
+              more.textContent = '…' + (lines.length - max) + ' more lines';
+              parent.appendChild(more);
+            }
+          };
+
+          // Exact removed → added strings from search_replace (PR-style focus).
+          const rp = msg.replacePreview;
+          if (rp && (rp.oldString || rp.newString)) {
+            const box = document.createElement('div');
+            box.className = 'diff-replace';
+            const remHd = document.createElement('div');
+            remHd.className = 'diff-replace-hd del';
+            remHd.textContent = rp.replaceAll
+              ? ('Removed ×' + (rp.matchCount || 1))
+              : 'Removed';
+            box.appendChild(remHd);
+            appendPlainLines(box, rp.oldString, 'del');
+            const addHd = document.createElement('div');
+            addHd.className = 'diff-replace-hd add';
+            addHd.textContent = 'Added';
+            box.appendChild(addHd);
+            appendPlainLines(box, rp.newString, 'add');
+            wrap.appendChild(box);
+          }
+
+          const view = document.createElement('div');
+          view.className = 'diff-view';
+          const hunks = Array.isArray(diff.hunks) ? diff.hunks : [];
+
+          if (hunks.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'diff-empty';
+            empty.textContent = msg.isDelete
+              ? '(file will be deleted)'
+              : (msg.isNew ? '(new file)' : (rp ? '' : '(no line changes)'));
+            if (empty.textContent) view.appendChild(empty);
+          } else {
+            for (const hunk of hunks) {
+              const block = document.createElement('div');
+              block.className = 'diff-hunk';
+              if (hunk.header) {
+                const hh = document.createElement('div');
+                hh.className = 'diff-hunk-hd';
+                hh.textContent = hunk.header;
+                block.appendChild(hh);
+              }
+              for (const line of (hunk.lines || [])) {
+                const row = document.createElement('div');
+                const kind = line.kind === 'add' ? 'add' : (line.kind === 'del' ? 'del' : 'ctx');
+                row.className = 'diff-line ' + kind;
+                const ln = document.createElement('span');
+                ln.className = 'ln';
+                const lineNo = kind === 'del'
+                  ? line.oldLine
+                  : (kind === 'add' ? line.newLine : (line.newLine || line.oldLine));
+                ln.textContent = lineNo != null ? String(lineNo) : '';
+                const gutter = document.createElement('span');
+                gutter.className = 'gutter';
+                gutter.textContent = kind === 'add' ? '+' : (kind === 'del' ? '−' : ' ');
+                row.appendChild(ln);
+                row.appendChild(gutter);
+                appendSegments(row, line);
+                block.appendChild(row);
+              }
+              view.appendChild(block);
+            }
+            if (diff.truncated) {
+              const more = document.createElement('div');
+              more.className = 'diff-empty';
+              more.textContent = '…more changes omitted';
+              view.appendChild(more);
+            }
+          }
+          if (view.childNodes.length) wrap.appendChild(view);
+
           const row = document.createElement('div');
           row.className = 'row';
-          const apply = document.createElement('button');
-          apply.className = 'primary';
-          apply.textContent = msg.isDelete ? 'Delete' : 'Apply';
-          apply.onclick = () => vscode.postMessage({ type: 'applyEdit', editId: msg.id });
-          const reject = document.createElement('button');
-          reject.textContent = 'Reject';
-          reject.onclick = () => vscode.postMessage({ type: 'rejectEdit', editId: msg.id });
-          row.appendChild(apply);
-          row.appendChild(reject);
-          wrap.appendChild(title);
-          wrap.appendChild(pre);
-          wrap.appendChild(row);
+          const compare = document.createElement('button');
+          compare.textContent = 'Compare';
+          compare.title = 'Open side-by-side diff';
+          compare.onclick = () => vscode.postMessage({ type: 'openEditDiff', editId: msg.id });
+          row.appendChild(compare);
+          if (!msg.autoApply) {
+            const apply = document.createElement('button');
+            apply.className = 'primary';
+            apply.textContent = msg.isDelete ? 'Delete' : 'Apply';
+            apply.onclick = () => vscode.postMessage({ type: 'applyEdit', editId: msg.id });
+            const reject = document.createElement('button');
+            reject.textContent = 'Reject';
+            reject.onclick = () => vscode.postMessage({ type: 'rejectEdit', editId: msg.id });
+            row.appendChild(apply);
+            row.appendChild(reject);
+            wrap.appendChild(row);
+          } else {
+            wrap.appendChild(row);
+            const st = document.createElement('div');
+            st.className = 'cmd-card-status';
+            st.textContent = 'Auto-applying…';
+            wrap.appendChild(st);
+          }
           messagesEl.appendChild(wrap);
+          try { wrap.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); } catch (_) {}
+          pinBusyToBottom();
+          break;
+        }
+        case 'editNeedsApply': {
+          const el = document.querySelector('[data-edit-id="' + msg.id + '"]');
+          if (el && !el.querySelector('button')) {
+            const st = el.querySelector('.cmd-card-status');
+            if (st) st.remove();
+            const row = document.createElement('div');
+            row.className = 'row';
+            const apply = document.createElement('button');
+            apply.className = 'primary';
+            apply.textContent = 'Apply';
+            apply.onclick = () => vscode.postMessage({ type: 'applyEdit', editId: msg.id });
+            const reject = document.createElement('button');
+            reject.textContent = 'Reject';
+            reject.onclick = () => vscode.postMessage({ type: 'rejectEdit', editId: msg.id });
+            row.appendChild(apply);
+            row.appendChild(reject);
+            el.appendChild(row);
+          }
           pinBusyToBottom();
           break;
         }
@@ -1645,7 +2967,15 @@ class BlossomChatSession {
           const el = document.querySelector('[data-edit-id="' + msg.id + '"]');
           if (el) {
             el.querySelectorAll('button').forEach((b) => b.disabled = true);
-            el.appendChild(document.createTextNode(msg.type === 'editApplied' ? ' ✓ applied' : ' ✗ rejected'));
+            let st = el.querySelector('.cmd-card-status');
+            if (!st) {
+              st = document.createElement('div');
+              st.className = 'cmd-card-status';
+              el.appendChild(st);
+            }
+            st.textContent = msg.type === 'editApplied'
+              ? (msg.auto ? '✓ Auto-applied' : '✓ Applied')
+              : '✗ Rejected';
           }
           if (msg.type === 'editApplied' && msg.path && !el) {
             // Quiet marker only — no "Done — applied" chat spam
@@ -1658,16 +2988,9 @@ class BlossomChatSession {
           break;
         }
         case 'error':
-          if (thoughtsEl) {
-            thoughtsEl.open = false;
-            const sum = thoughtsEl.querySelector('summary');
-            if (sum) sum.textContent = 'Failed';
-          }
           streamingEl = null;
           showErrorCard(msg.text || 'Unknown error', msg.question || lastAsk);
           setBusy(false);
-          thoughtsEl = null;
-          thoughtsList = null;
           break;
         case 'codingSummary': {
           const card = document.createElement('div');
@@ -1686,16 +3009,13 @@ class BlossomChatSession {
           const updated = msg.updated || [];
           const deleted = msg.deleted || [];
           const notes = Array.isArray(msg.modelNotes) ? msg.modelNotes : [];
-          // Prefer disk-truth from Apply over model prose (models often fake "Deleted …").
+          // Model narration first ("what I did"), then disk-truth paths.
+          notes.forEach((n) => add(n));
           const hasDiskEdits = created.length + updated.length + deleted.length > 0;
           if (hasDiskEdits) {
             created.forEach((p) => add('Created ' + p));
             updated.forEach((p) => add('Updated ' + p));
             deleted.forEach((p) => add('Deleted ' + p));
-          } else if (notes.length > 0) {
-            notes.forEach((n) => add(n));
-          }
-          if (hasDiskEdits) {
             const n = created.length + updated.length + deleted.length;
             add(msg.autoApplied
               ? 'Changes were written to disk (auto-apply).'
@@ -1710,33 +3030,91 @@ class BlossomChatSession {
           break;
         }
         case 'assistantDone':
-          if (streamingEl && typeof msg.text === 'string' && msg.text.length) {
-            renderAssistant(streamingEl, msg.text);
-          } else if (streamingEl && streamingEl.textContent) {
-            renderAssistant(streamingEl, streamingEl.textContent);
+          // With live per-file streamBreaks, do NOT replace the last bubble with
+          // the full turn text — each segment already holds its own slice.
+          if (streamingEl) {
+            const body = streamingEl.textContent || '';
+            if (body.trim()) {
+              renderAssistant(streamingEl, body);
+            } else {
+              streamingEl.remove();
+              streamingEl = null;
+            }
+          }
+          if (msg.feedbackId) {
+            const target = streamingEl || messagesEl.querySelector('.msg.assistant:last-of-type');
+            if (target) attachFeedback(target, msg.feedbackId);
+          }
+          if (msg.deescalateAvailable) {
+            const deTarget = messagesEl.querySelector('.feedback-row:last-of-type')
+              || streamingEl
+              || messagesEl.querySelector('.msg.assistant:last-of-type');
+            if (deTarget) attachDeescalate(deTarget);
           }
           setBusy(false);
           streamingEl = null;
-          thoughtsEl = null;
-          thoughtsList = null;
           break;
-        case 'cleared':
-          messagesEl.innerHTML = '';
-          thoughtsEl = null;
-          thoughtsList = null;
-          lastAsk = '';
-          resetReasoningTicker();
-          streamingEl = null;
-          // Recreate busy row after clear (innerHTML wiped it)
-          {
-            const row = document.createElement('div');
-            row.className = 'busy-row';
-            row.id = 'busyRow';
-            row.setAttribute('aria-hidden', 'true');
-            row.innerHTML = '<div class="spinner" id="busySpinner" title="Working…"></div><span id="busyLabel">Working…</span><div id="busyReasoningWrap" class="busy-reasoning-wrap" aria-live="polite"><span class="busy-reasoning-label">Reasoning</span><span id="busyReasoning" class="busy-reasoning"></span></div>';
-            messagesEl.appendChild(row);
+        case 'feedbackResult': {
+          const row = document.querySelector('.feedback-row[data-feedback-id="' + (msg.feedbackId || '') + '"]');
+          if (row) {
+            const st = row.querySelector('.fb-status');
+            if (st) {
+              st.textContent = msg.ok
+                ? (msg.verdict === 'incorrect' ? 'Marked incorrect' : 'Marked correct')
+                : ('Failed: ' + (msg.error || 'error'));
+            }
+            if (!msg.ok) {
+              row.querySelectorAll('button').forEach((b) => { b.disabled = false; b.classList.remove('active-up', 'active-down'); });
+            }
           }
           break;
+        }
+        case 'cleared':
+          wipeMessages();
+          break;
+        case 'restoreHistory': {
+          wipeMessages();
+          const msgs = msg.messages || [];
+          for (const m of msgs) {
+            if (!m || !m.content) continue;
+            if (m.role === 'user') {
+              append('user', m.content);
+            } else if (m.role === 'assistant') {
+              const el = append('assistant', '');
+              renderAssistant(el, m.content);
+            }
+          }
+          const note = document.createElement('div');
+          note.className = 'tool';
+          note.textContent = msgs.length
+            ? 'Restored from History — continue this chat or ask about it.'
+            : 'Opened saved chat (empty transcript).';
+          messagesEl.appendChild(note);
+          pinBusyToBottom();
+          break;
+        }
+        case 'imageAttachments': {
+          const items = msg.items || [];
+          for (const it of items) {
+            if (!it || !it.path) continue;
+            if (pendingAttachments.some((p) => p.path === it.path)) continue;
+            pendingAttachments.push({
+              path: it.path,
+              fileName: it.fileName || it.path.split(/[/\\\\]/).pop(),
+              metadata: it.metadata,
+            });
+          }
+          renderAttachmentChips();
+          break;
+        }
+        case 'contextInjectError': {
+          const t = document.createElement('div');
+          t.className = 'tool';
+          t.textContent = msg.error || 'Could not add context';
+          messagesEl.appendChild(t);
+          pinBusyToBottom();
+          break;
+        }
       }
     });
 

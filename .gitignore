@@ -48,3 +48,11 @@ coverage/
 tmp/
 temp/
 *.tmp
+
+# Agent probe scripts (written by Blossom Assistant research loop)
+.blossom/scratch/*
+!.blossom/scratch/.gitkeep
+
+# Saved Blossom chat archives (local revisit / agent lookup)
+.blossom/chats/*
+!.blossom/chats/.gitkeep

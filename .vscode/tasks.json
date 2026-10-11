@@ -2,23 +2,46 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "compile",
       "type": "npm",
       "script": "compile",
       "group": {
         "kind": "build",
         "isDefault": true
       },
-      "problemMatcher": "$tsc"
+      "problemMatcher": "$tsc",
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "clear": true
+      }
     },
     {
+      "label": "watch",
       "type": "npm",
       "script": "watch",
       "isBackground": true,
       "problemMatcher": "$tsc-watch",
       "presentation": {
-        "reveal": "never"
+        "reveal": "never",
+        "panel": "dedicated",
+        "clear": false
       },
-      "group": "build"
+      "group": "build",
+      "runOptions": {
+        "runOn": "folderOpen"
+      }
+    },
+    {
+      "label": "package",
+      "type": "npm",
+      "script": "package",
+      "group": "none",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
     }
   ]
 }

@@ -30,10 +30,13 @@ Set `blossom.backend` = `ollama` and `blossom.api.baseUrl` = `http://localhost:1
 
 ## Quick start
 
-1. `npm install` && `npm run compile` (if building from source)
-2. Install the `.vsix`, or `F5` to debug
-3. Click the **cherry blossom** in the **editor title bar**, or **Blossom: Open Chat**
-4. Confirm `api.baseUrl` points at a running ChatRouter / Ollama
+1. Build + install (pick one):
+   - **One-click install (recommended):** double-click `install.bat` — compiles, packs a `.vsix`, and installs into Cursor / VS Code. Then **Reload Window**.
+   - **Debug without installing:** open this folder and press **F5** (Extension Development Host)
+   - **Compile only:** `compile.bat`, `watch.bat`, `Ctrl+Shift+B`, or auto-watch on folder open
+   - **Manual:** `npm install` && `npm run compile` && `npm run package` && `cursor --install-extension blossom-assistant-*.vsix`
+2. Click the **cherry blossom** in the **editor title bar**, or **Blossom: Open Chat**
+3. Confirm `api.baseUrl` points at a running ChatRouter / Ollama
 
 ## Repo knowledge (persisted)
 
@@ -43,9 +46,19 @@ Blossom indexes your workspace (structure, manifests, entry points) into workspa
 - Injects a compact repo map into coding prompts
 - Commands: **Blossom: Refresh Repo Knowledge**, **Blossom: Show Repo Knowledge**
 
+## Scratchpad
+
+Workspace-scoped working notes (not durable Chroma memory), capped at ~4k chars:
+
+- Host decides necessity (multi-step / multi-file / plan / RE / tool failures) and injects REQUIRED vs optional vs skip
+- Agent maintains the pad itself; host autofills from PLAN/Summary if it forgets on a REQUIRED turn
+- **Scratchpad** chip in chat, or **Blossom: Edit / Show / Clear Scratchpad**
+- Survives **Clear** chat; cleared only via Clear Scratchpad / empty overwrite
+
 ## Session controls
 
 - **Auto-apply** — write proposed file edits to disk without clicking Apply (this chat session only)
+- **Scratchpad** — workspace working notes for multi-step tasks
 - **Ping** — recheck backend health
 - **Clear** / **Stop**
 

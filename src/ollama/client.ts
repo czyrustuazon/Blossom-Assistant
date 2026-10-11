@@ -56,20 +56,89 @@ export interface ChatStreamChunk {
   /** Which brain answered (local_coder / claude / gemini / persona) */
   intelSource?: string;
   intelLabel?: string;
+  /** Correctness feedback id from ChatRouter (coding / japanese routes) */
+  feedback?: { id: string; route?: string; enabled?: boolean };
 }
 
 export class LlmError extends Error {
   constructor(
     message: string,
-    readonly status?: number
+    readonly status?: number,
+    readonly code?: string
   ) {
     super(message);
     this.name = "LlmError";
   }
 }
 
+/** ChatRouter deferred cloud — extension should show escalation picker. */
+export class DeferCloudEscalationError extends LlmError {
+  constructor(
+    message: string,
+    readonly localAttempt: string
+  ) {
+    super(message, 503, "defer_cloud_escalation");
+    this.name = "DeferCloudEscalationError";
+  }
+}
+
 /** @deprecated alias */
 export const OllamaError = LlmError;
+
+function parseDeferCloudDetail(
+  detail: unknown
+): DeferCloudEscalationError | undefined {
+  if (!detail || typeof detail !== "object" || Array.isArray(detail)) {
+    return undefined;
+  }
+  const d = detail as Record<string, unknown>;
+  if (d.code !== "defer_cloud_escalation") {
+    return undefined;
+  }
+  return new DeferCloudEscalationError(
+    String(d.reason ?? "Local coder failed"),
+    String(d.local_attempt ?? "")
+  );
+}
+
+function parseChatRouterErrorPayload(data: Record<string, unknown>): LlmError {
+  const rawDetail = data.detail ?? data.message;
+  const defer = parseDeferCloudDetail(rawDetail);
+  if (defer) {
+    return defer;
+  }
+  if (typeof rawDetail === "string") {
+    try {
+      const parsed = JSON.parse(rawDetail) as unknown;
+      const fromJson = parseDeferCloudDetail(parsed);
+      if (fromJson) {
+        return fromJson;
+      }
+    } catch {
+      // plain string detail
+    }
+  }
+  const detail =
+    typeof rawDetail === "string"
+      ? rawDetail
+      : rawDetail != null
+        ? JSON.stringify(rawDetail)
+        : "";
+  const message =
+    detail ||
+    (data.message != null ? String(data.message) : "") ||
+    "ChatRouter stream error";
+  const code =
+    typeof data.code === "number"
+      ? data.code
+      : typeof data.status_code === "number"
+        ? data.status_code
+        : undefined;
+  return new LlmError(
+    code != null ? `ChatRouter error (${code}): ${message}` : `ChatRouter error: ${message}`,
+    code
+  );
+}
 
 function normalizeThought(data: Record<string, unknown>): BlossomThought {
   const message = String(data.message ?? data.step ?? "…");
@@ -134,7 +203,10 @@ export async function checkHealth(): Promise<{ ok: boolean; detail: string }> {
 async function checkChatRouterHealth(): Promise<{ ok: boolean; detail: string }> {
   const url = `${baseUrl()}/health`;
   try {
-    const res = await fetch(url, { method: "GET" });
+    const res = await fetch(url, {
+      method: "GET",
+      signal: AbortSignal.timeout(8000),
+    });
     if (!res.ok) {
       return { ok: false, detail: `HTTP ${res.status} from ${url}` };
     }
@@ -149,7 +221,7 @@ async function checkChatRouterHealth(): Promise<{ ok: boolean; detail: string }>
       return { ok: false, detail: `ChatRouter reported not ok at ${url}` };
     }
     const parts = [
-      `ChatRouter OK`,
+      `Blossom OK`,
       data.active_role ? `role=${data.active_role}` : "",
       data.model_voice ? `voice=${data.model_voice}` : "",
       data.model_coder ? `coder=${data.model_coder}` : "",
@@ -165,7 +237,10 @@ async function checkChatRouterHealth(): Promise<{ ok: boolean; detail: string }>
 async function checkOllamaHealth(): Promise<{ ok: boolean; detail: string }> {
   const url = `${baseUrl()}/api/tags`;
   try {
-    const res = await fetch(url, { method: "GET" });
+    const res = await fetch(url, {
+      method: "GET",
+      signal: AbortSignal.timeout(8000),
+    });
     if (!res.ok) {
       return { ok: false, detail: `HTTP ${res.status} from ${url}` };
     }
@@ -258,6 +333,10 @@ export interface ChatRequest {
   tools?: ChatTool[];
   stream?: boolean;
   signal?: AbortSignal;
+  /** When true, ChatRouter stops before auto cloud fallback — extension shows picker. */
+  deferCloud?: boolean;
+  /** Force sequential chunk catalog mode (context overflow recovery). */
+  sequentialMode?: boolean;
 }
 
 export async function* streamChat(
@@ -274,6 +353,7 @@ export async function chatOnce(req: ChatRequest): Promise<{
   content: string;
   toolCalls: ToolCall[];
   thoughts?: BlossomThought[];
+  feedback?: { id: string; route?: string; enabled?: boolean };
 }> {
   if (backend() === "chatRouter") {
     return chatCompletionsOpenAI({ ...req, tools: undefined, stream: false });
@@ -300,12 +380,25 @@ async function* streamChatRouter(
       messages: openaiMessages,
       stream: true,
       temperature: 0.82,
+      ...(req.deferCloud ? { blossom_defer_cloud: true } : {}),
+      ...(req.sequentialMode ? { blossom_sequential_mode: true } : {}),
     }),
     signal: req.signal,
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown };
+      const defer = parseDeferCloudDetail(parsed.detail);
+      if (defer) {
+        throw defer;
+      }
+    } catch (err) {
+      if (err instanceof DeferCloudEscalationError) {
+        throw err;
+      }
+    }
     throw new LlmError(
       `ChatRouter stream failed (${res.status}): ${text || res.statusText}`,
       res.status
@@ -338,27 +431,7 @@ async function* streamChatRouter(
     const object = String(data.object ?? "");
 
     if (object === "error" || data.error != null) {
-      const errObj = data.error;
-      const detail =
-        typeof errObj === "string"
-          ? errObj
-          : errObj && typeof errObj === "object" && "message" in (errObj as object)
-            ? String((errObj as { message?: unknown }).message ?? "")
-            : "";
-      const message =
-        detail ||
-        (data.message != null ? String(data.message) : "") ||
-        "ChatRouter stream error";
-      const code =
-        typeof data.code === "number"
-          ? data.code
-          : typeof data.status_code === "number"
-            ? data.status_code
-            : undefined;
-      throw new LlmError(
-        code != null ? `ChatRouter error (${code}): ${message}` : `ChatRouter error: ${message}`,
-        code
-      );
+      throw parseChatRouterErrorPayload(data);
     }
 
     if (object === "blossom.intel") {
@@ -382,6 +455,25 @@ async function* streamChatRouter(
       yield {
         thought: normalizeThought(data),
       };
+      return;
+    }
+
+    if (object === "blossom.feedback") {
+      const id =
+        data.id != null
+          ? String(data.id)
+          : data.feedback_id != null
+            ? String(data.feedback_id)
+            : "";
+      if (id) {
+        yield {
+          feedback: {
+            id,
+            route: data.route != null ? String(data.route) : undefined,
+            enabled: data.enabled !== false,
+          },
+        };
+      }
       return;
     }
 
@@ -491,6 +583,7 @@ async function chatCompletionsOpenAI(req: ChatRequest): Promise<{
   content: string;
   toolCalls: ToolCall[];
   thoughts?: BlossomThought[];
+  feedback?: { id: string; route?: string; enabled?: boolean };
 }> {
   const url = `${baseUrl()}/v1/chat/completions`;
   const openaiMessages = req.messages
@@ -505,12 +598,25 @@ async function chatCompletionsOpenAI(req: ChatRequest): Promise<{
       messages: openaiMessages,
       stream: false,
       temperature: 0.82,
+      ...(req.deferCloud ? { blossom_defer_cloud: true } : {}),
+      ...(req.sequentialMode ? { blossom_sequential_mode: true } : {}),
     }),
     signal: req.signal,
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown; error?: { message?: string } };
+      const defer = parseDeferCloudDetail(parsed.detail);
+      if (defer) {
+        throw defer;
+      }
+    } catch (err) {
+      if (err instanceof DeferCloudEscalationError) {
+        throw err;
+      }
+    }
     throw new LlmError(
       `ChatRouter failed (${res.status}): ${text || res.statusText}`,
       res.status
@@ -519,6 +625,12 @@ async function chatCompletionsOpenAI(req: ChatRequest): Promise<{
 
   const data = (await res.json()) as {
     blossom_thoughts?: Array<Record<string, unknown>>;
+    blossom_feedback?: {
+      id?: string;
+      feedback_id?: string;
+      route?: string;
+      enabled?: boolean;
+    };
     choices?: Array<{
       message?: {
         content?: string | Array<{ type?: string; text?: string }>;
@@ -557,10 +669,23 @@ async function chatCompletionsOpenAI(req: ChatRequest): Promise<{
     thoughts.push({ step: "model_reasoning", message: reasoning });
   }
 
+  const fb = data.blossom_feedback;
+  const feedbackId =
+    fb && fb.enabled !== false
+      ? String(fb.id || fb.feedback_id || "").trim()
+      : "";
+
   return {
     content,
     toolCalls,
     thoughts: thoughts.length > 0 ? thoughts : undefined,
+    feedback: feedbackId
+      ? {
+          id: feedbackId,
+          route: fb?.route != null ? String(fb.route) : undefined,
+          enabled: true,
+        }
+      : undefined,
   };
 }
 

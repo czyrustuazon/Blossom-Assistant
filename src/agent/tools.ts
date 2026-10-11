@@ -1,8 +1,30 @@
+import { spawn } from "child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as vscode from "vscode";
 import { getConfig } from "../config";
 import type { OllamaTool } from "../ollama/client";
+import { validateProposedEdit } from "./editGuard";
+import { validatePatchScriptEdit, warmPatchIndex } from "./patchScriptContext";
+import { validateDryRunBeforeApply } from "./dryRunGate";
+import { readGhidra, type ReadGhidraAction } from "../ghidra/client";
+import { callGhidraMcpTool } from "../mcp/ghidraMcpClient";
+import {
+  AGENT_SCRATCH_PREFIX,
+  isAgentScratchPath,
+  scratchWriteDeniedMessage,
+} from "./scratchPaths";
+import {
+  formatArchiveForAgent,
+  formatArchiveList,
+  listChatArchives,
+  loadChatArchive,
+  searchChatArchives,
+} from "./chatArchive";
+
+const RUN_COMMAND_DEFAULT_TIMEOUT_MS = 60_000;
+const RUN_COMMAND_MAX_TIMEOUT_MS = 180_000;
+const RUN_COMMAND_MAX_OUTPUT_CHARS = 64_000;
 
 export interface ToolResult {
   ok: boolean;
@@ -19,7 +41,21 @@ export interface PendingEdit {
   oldContent: string;
   /** write = create/update file; delete = remove file from disk */
   kind?: "write" | "delete";
+  /** How this edit was produced — drives PR-style replace preview in chat. */
+  source?: "write_file" | "search_replace" | "fence" | "delete";
+  /** Exact old→new strings from search_replace (shown as removed/added blocks). */
+  replacePreview?: {
+    oldString: string;
+    newString: string;
+    replaceAll?: boolean;
+    matchCount?: number;
+  };
 }
+
+export type ProposeWriteMeta = {
+  source?: PendingEdit["source"];
+  replacePreview?: PendingEdit["replacePreview"];
+};
 
 export interface RelatedFolder {
   /** Short name used in tools (workspace folder name or sibling basename). */
@@ -32,6 +68,142 @@ export interface RelatedFolder {
 }
 
 const pendingEdits = new Map<string, PendingEdit>();
+
+/** Recent search_text hits — used to window read_file around match lines. */
+const searchLineHints = new Map<string, number[]>();
+
+const READ_WINDOW_PAD = 15;
+const READ_WINDOW_MAX_SPAN = 80;
+/** Soft-cap when read_file has no range and no search hint. */
+const FULL_READ_SOFT_CAP_LINES = 200;
+
+export type ToolProfile = "minimal" | "research" | "full";
+
+/** Set by the agent loop so research/minimal can gate product writes. */
+let activeToolProfile: ToolProfile = "full";
+
+export function setActiveToolProfile(profile: ToolProfile): void {
+  activeToolProfile = profile;
+}
+
+export function getActiveToolProfile(): ToolProfile {
+  return activeToolProfile;
+}
+
+/** Catalog names for tiny edits — no shell / sibling / ghidra noise. */
+const MINIMAL_TOOL_NAMES = new Set([
+  "read_file",
+  "search_text",
+  "search_replace",
+]);
+
+/** Plan / research — inspect + verify; scratch write/delete only (gated in propose*). */
+const RESEARCH_TOOL_NAMES = new Set([
+  "list_workspace_roots",
+  "list_dir",
+  "read_file",
+  "search_text",
+  "run_command",
+  "write_file",
+  "delete_file",
+  "read_ghidra",
+  "ghidra_mcp",
+  "list_related",
+  "peek_related",
+  "list_chat_history",
+  "read_chat_history",
+  "search_chat_history",
+]);
+
+/** Aliases kept in runTool for back-compat but omitted from catalogs. */
+const CATALOG_ALIAS_NAMES = new Set(["list_siblings", "peek_sibling"]);
+
+function normalizeHintPath(p: string): string {
+  return p.replace(/\\/g, "/").toLowerCase();
+}
+
+function rememberSearchHit(relPath: string, line: number): void {
+  const key = normalizeHintPath(relPath);
+  const prev = searchLineHints.get(key) ?? [];
+  if (!prev.includes(line)) {
+    prev.push(line);
+    prev.sort((a, b) => a - b);
+  }
+  searchLineHints.set(key, prev);
+}
+
+/** Cluster nearby search hits into one read window (first dense cluster). */
+function clusterSearchLines(lines: number[]): { start: number; end: number } {
+  const sorted = [...lines].sort((a, b) => a - b);
+  let lo = sorted[0];
+  let hi = sorted[0];
+  for (const ln of sorted) {
+    if (ln - lo <= READ_WINDOW_MAX_SPAN) {
+      hi = ln;
+    } else {
+      break;
+    }
+  }
+  return {
+    start: Math.max(1, lo - READ_WINDOW_PAD),
+    end: hi + READ_WINDOW_PAD,
+  };
+}
+
+function resolveReadLineWindow(
+  displayPath: string,
+  startLine?: number,
+  endLine?: number
+): { start?: number; end?: number; fromSearch: boolean } {
+  if (startLine != null || endLine != null) {
+    return {
+      start: startLine != null ? Math.max(1, Math.floor(startLine)) : undefined,
+      end: endLine != null ? Math.max(1, Math.floor(endLine)) : undefined,
+      fromSearch: false,
+    };
+  }
+  const key = normalizeHintPath(displayPath);
+  let lines = searchLineHints.get(key);
+  if (!lines?.length) {
+    const base = key.split("/").pop() ?? key;
+    for (const [k, v] of searchLineHints) {
+      if (k === base || k.endsWith(`/${base}`)) {
+        lines = v;
+        break;
+      }
+    }
+  }
+  if (!lines?.length) {
+    return { fromSearch: false };
+  }
+  const cluster = clusterSearchLines(lines);
+  return {
+    start: cluster.start,
+    end: cluster.end,
+    fromSearch: true,
+  };
+}
+
+export function clearSearchLineHints(): void {
+  searchLineHints.clear();
+}
+
+/** Map prompt tier + settings override → tool catalog profile. */
+export function resolveToolProfile(
+  tier: "full" | "plan" | "tiny",
+  override: "auto" | ToolProfile = "auto"
+): ToolProfile {
+  if (override !== "auto") {
+    return override;
+  }
+  if (tier === "tiny") {
+    return "minimal";
+  }
+  if (tier === "plan") {
+    return "research";
+  }
+  return "full";
+}
 
 export function getPendingEdit(id: string): PendingEdit | undefined {
   return pendingEdits.get(id);
@@ -49,6 +221,68 @@ export const AGENT_TOOLS: OllamaTool[] = [
       description:
         "List all folders in the VS Code multi-root workspace (name + absolute path). Use these names as path prefixes.",
       parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_chat_history",
+      description:
+        "List saved Blossom chat archives in this workspace (.blossom/chats). Use when the user asks about a past conversation or wants you to recall an earlier chat.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: {
+            type: "number",
+            description: "Max chats to list (default 30).",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_chat_history",
+      description:
+        "Read one saved Blossom chat by id (from list_chat_history). Optional query filters messages containing that text.",
+      parameters: {
+        type: "object",
+        properties: {
+          id: {
+            type: "string",
+            description: "Chat archive id (e.g. chat-2026-…).",
+          },
+          query: {
+            type: "string",
+            description: "Optional substring filter on message content.",
+          },
+          maxChars: {
+            type: "number",
+            description: "Max characters to return (default 12000).",
+          },
+        },
+        required: ["id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "search_chat_history",
+      description:
+        "Search across saved Blossom chats for a keyword/phrase. Prefer this when the user refers to something discussed in an earlier session.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Text to find in past chats." },
+          maxChats: {
+            type: "number",
+            description: "Max matching chats to return (default 8).",
+          },
+        },
+        required: ["query"],
+      },
     },
   },
   {
@@ -87,6 +321,14 @@ export const AGENT_TOOLS: OllamaTool[] = [
             type: "string",
             description: "Optional workspace folder name when path has no prefix.",
           },
+          startLine: {
+            type: "number",
+            description: "Optional 1-based start line (defaults to search hit window).",
+          },
+          endLine: {
+            type: "number",
+            description: "Optional 1-based end line (defaults to search hit window).",
+          },
         },
         required: ["path"],
       },
@@ -119,13 +361,44 @@ export const AGENT_TOOLS: OllamaTool[] = [
   {
     type: "function",
     function: {
-      name: "write_file",
+      name: "search_replace",
       description:
-        "Propose writing/updating a file inside a workspace root (not disk siblings). User must approve before apply. Use 'RootName/path' in multi-root.",
+        "Preferred for EDITING existing files: replace one exact old_string with new_string. old_string must match the file exactly (including whitespace). Use replace_all only when intentional. Safer and smaller than write_file for changes.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "Workspace-relative file path." },
+          old_string: {
+            type: "string",
+            description: "Exact text to find (must be unique unless replace_all).",
+          },
+          new_string: { type: "string", description: "Replacement text." },
+          replace_all: {
+            type: "boolean",
+            description: "Replace every occurrence (default false).",
+          },
+          root: {
+            type: "string",
+            description: "Optional workspace folder name when path has no prefix.",
+          },
+        },
+        required: ["path", "old_string", "new_string"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description:
+        `Create/replace a file. Product edits need Apply. Probe helpers: write under ${AGENT_SCRATCH_PREFIX}*.py (auto-applied, no Apply card), then run_command. For existing product files prefer search_replace.`,
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: `Workspace-relative path. Scratch probes: ${AGENT_SCRATCH_PREFIX}<name>.py`,
+          },
           content: { type: "string", description: "Full new file contents." },
           root: {
             type: "string",
@@ -141,7 +414,7 @@ export const AGENT_TOOLS: OllamaTool[] = [
     function: {
       name: "delete_file",
       description:
-        "Propose deleting a file inside a workspace root. User must approve (or auto-apply) before the file is removed. Use for unused/orphan files listed in [UNUSED FILES].",
+        `Propose deleting a workspace file (Apply). Scratch probes under ${AGENT_SCRATCH_PREFIX} delete immediately. Use for unused/orphan files listed in [UNUSED FILES].`,
       parameters: {
         type: "object",
         properties: {
@@ -216,7 +489,123 @@ export const AGENT_TOOLS: OllamaTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "ghidra_mcp",
+      description:
+        "Call the local Ghidra MCP bridge (stdio). Workflow: tool=list_instances, then connect_instance, " +
+        "then decompile_function / search_functions / get_xrefs_to / list_strings / etc. " +
+        "Full tool surface without Cursor escalate. Prefer over read_ghidra for xrefs, strings, and multi-step RE.",
+      parameters: {
+        type: "object",
+        properties: {
+          tool: {
+            type: "string",
+            description: "Exact MCP tool name (see [GHIDRA MCP] block in prompt).",
+          },
+          arguments: {
+            type: "object",
+            description: "JSON arguments for that MCP tool.",
+          },
+        },
+        required: ["tool"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "read_ghidra",
+      description:
+        "Read reverse-engineering context from a connected Ghidra HTTP/MCP bridge (any project). " +
+        "Use before proposing ARM bytes, patch caves, or hook addresses. Auto-discovers bridge on localhost " +
+        "(ports 8089, 8192, …) or blossom.ghidra.baseUrl. Omit action+address for status.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            description:
+              "status | list_programs | program_info | decompile | disassemble | function_info | search_functions. Default: decompile if address set, else status.",
+          },
+          address: {
+            type: "string",
+            description: "Function address (0x001fc304). Required for decompile/disassemble/function_info.",
+          },
+          program: {
+            type: "string",
+            description:
+              "Ghidra program name when multiple binaries are open (e.g. code.bin). Omit to use active program or workspace guess.",
+          },
+          name_pattern: {
+            type: "string",
+            description: "Substring for search_functions.",
+          },
+          limit: {
+            type: "number",
+            description: "Max results for search_functions (default 40).",
+          },
+          timeout: {
+            type: "number",
+            description: "Decompile timeout seconds (default 60).",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_command",
+      description:
+        "Run a shell command inside a workspace root (full shell: python, tests, git status, etc.). " +
+        "Use during RESEARCH to reproduce bugs, run tests, or probe with short Python. " +
+        "cwd must stay inside a workspace root (not disk siblings). " +
+        "On Windows prefer `py -3` or `python` for Python. Output is truncated; long jobs time out.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: {
+            type: "string",
+            description: "Shell command to run (e.g. `py -3 scripts/probe.py` or `npm test`).",
+          },
+          cwd: {
+            type: "string",
+            description:
+              "Working directory relative to a workspace root (default '.'). Multi-root: RootName/subdir.",
+          },
+          root: {
+            type: "string",
+            description: "Optional workspace folder name when cwd has no RootName prefix.",
+          },
+          timeout_ms: {
+            type: "number",
+            description: "Optional timeout in ms (default 60000, max 180000).",
+          },
+        },
+        required: ["command"],
+      },
+    },
+  },
 ];
+
+/** Tools shown in the prompt / Ollama native tool list for a profile. */
+export function toolsForProfile(profile: ToolProfile): OllamaTool[] {
+  return AGENT_TOOLS.filter((t) => {
+    const name = t.function.name;
+    if (CATALOG_ALIAS_NAMES.has(name)) {
+      return false;
+    }
+    if (profile === "minimal") {
+      return MINIMAL_TOOL_NAMES.has(name);
+    }
+    if (profile === "research") {
+      return RESEARCH_TOOL_NAMES.has(name);
+    }
+    return true;
+  });
+}
 
 function workspaceFolders(): readonly vscode.WorkspaceFolder[] {
   const folders = vscode.workspace.workspaceFolders;
@@ -332,6 +721,48 @@ export async function runTool(
     switch (name) {
       case "list_workspace_roots":
         return listWorkspaceRoots();
+      case "list_chat_history": {
+        const entries = await listChatArchives();
+        const limit =
+          typeof args.limit === "number" && args.limit > 0
+            ? Math.min(args.limit, 80)
+            : 30;
+        return {
+          ok: true,
+          content: formatArchiveList(entries, limit),
+        };
+      }
+      case "read_chat_history": {
+        const id = String(args.id ?? "").trim();
+        if (!id) {
+          return { ok: false, content: "read_chat_history requires id." };
+        }
+        const arch = await loadChatArchive(id);
+        if (!arch) {
+          return {
+            ok: false,
+            content: `No saved chat with id "${id}". Use list_chat_history.`,
+          };
+        }
+        return {
+          ok: true,
+          content: formatArchiveForAgent(arch, {
+            query: args.query != null ? String(args.query) : undefined,
+            maxChars:
+              typeof args.maxChars === "number" ? args.maxChars : undefined,
+          }),
+        };
+      }
+      case "search_chat_history": {
+        const query = String(args.query ?? "");
+        return {
+          ok: true,
+          content: await searchChatArchives(query, {
+            maxChats:
+              typeof args.maxChats === "number" ? args.maxChats : undefined,
+          }),
+        };
+      }
       case "list_dir":
         return await listDir(
           String(args.path ?? "."),
@@ -340,7 +771,9 @@ export async function runTool(
       case "read_file":
         return await readFile(
           String(args.path ?? ""),
-          args.root ? String(args.root) : undefined
+          args.root ? String(args.root) : undefined,
+          typeof args.startLine === "number" ? args.startLine : undefined,
+          typeof args.endLine === "number" ? args.endLine : undefined
         );
       case "search_text":
         return await searchText(
@@ -348,6 +781,14 @@ export async function runTool(
           args.glob ? String(args.glob) : undefined,
           typeof args.maxResults === "number" ? args.maxResults : 40,
           args.root ? String(args.root) : undefined
+        );
+      case "search_replace":
+        return await searchReplaceInFile(
+          String(args.path ?? ""),
+          String(args.old_string ?? ""),
+          String(args.new_string ?? ""),
+          args.root ? String(args.root) : undefined,
+          Boolean(args.replace_all)
         );
       case "write_file":
         return await proposeWrite(
@@ -370,6 +811,49 @@ export async function runTool(
           String(args.sibling ?? args.name ?? ""),
           String(args.path ?? ".")
         );
+      case "run_command":
+        return await runCommand(
+          String(args.command ?? ""),
+          args.cwd != null ? String(args.cwd) : ".",
+          args.root ? String(args.root) : undefined,
+          typeof args.timeout_ms === "number"
+            ? args.timeout_ms
+            : typeof args.timeoutMs === "number"
+              ? args.timeoutMs
+              : RUN_COMMAND_DEFAULT_TIMEOUT_MS
+        );
+      case "ghidra_mcp": {
+        let mcpArgs: Record<string, unknown> = {};
+        const rawArgs = args.arguments ?? args.args;
+        if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+          mcpArgs = rawArgs as Record<string, unknown>;
+        } else if (typeof rawArgs === "string") {
+          try {
+            mcpArgs = JSON.parse(rawArgs) as Record<string, unknown>;
+          } catch {
+            mcpArgs = {};
+          }
+        }
+        const mcpResult = await callGhidraMcpTool({
+          tool: String(args.tool ?? ""),
+          arguments: mcpArgs,
+        });
+        return { ok: mcpResult.ok, content: mcpResult.content };
+      }
+      case "read_ghidra":
+        return await readGhidra({
+          action: args.action ? (String(args.action) as ReadGhidraAction) : undefined,
+          address: args.address != null ? String(args.address) : undefined,
+          program: args.program != null ? String(args.program) : undefined,
+          name_pattern:
+            args.name_pattern != null
+              ? String(args.name_pattern)
+              : args.namePattern != null
+                ? String(args.namePattern)
+                : undefined,
+          limit: typeof args.limit === "number" ? args.limit : undefined,
+          timeout: typeof args.timeout === "number" ? args.timeout : undefined,
+        });
       default:
         return { ok: false, content: `Unknown tool: ${name}` };
     }
@@ -409,16 +893,43 @@ async function listDir(rel: string, rootHint?: string): Promise<ToolResult> {
   };
 }
 
-async function readFile(rel: string, rootHint?: string): Promise<ToolResult> {
+async function readFile(
+  rel: string,
+  rootHint?: string,
+  startLine?: number,
+  endLine?: number
+): Promise<ToolResult> {
   if (!rel) {
     return { ok: false, content: "path is required" };
   }
   const { absolutePath, displayPath } = resolveInWorkspace(rel, rootHint);
   const buf = await fs.readFile(absolutePath);
   const max = 200_000;
-  const text = buf.slice(0, max).toString("utf8");
+  let text = buf.slice(0, max).toString("utf8");
   const truncated = buf.length > max ? `\n\n… truncated (${buf.length} bytes total)` : "";
-  return { ok: true, content: `// ${displayPath}\n${text}${truncated}` };
+
+  const window = resolveReadLineWindow(displayPath, startLine, endLine);
+  let lineNote = "";
+  const allLines = text.split(/\r?\n/);
+  if (window.start != null || window.end != null) {
+    const start = window.start ?? 1;
+    const end = window.end ?? allLines.length;
+    const slice = allLines.slice(start - 1, end);
+    lineNote = window.fromSearch
+      ? ` (lines ${start}-${Math.min(end, allLines.length)} — search window)`
+      : ` (lines ${start}-${Math.min(end, allLines.length)})`;
+    text = slice.join("\n");
+  } else if (allLines.length > FULL_READ_SOFT_CAP_LINES) {
+    text = allLines.slice(0, FULL_READ_SOFT_CAP_LINES).join("\n");
+    lineNote =
+      ` (lines 1-${FULL_READ_SOFT_CAP_LINES} of ${allLines.length}` +
+      ` — pass startLine/endLine or search_text first for the rest)`;
+  }
+
+  return {
+    ok: true,
+    content: `// ${displayPath}${lineNote}\n${text}${truncated}`,
+  };
 }
 
 async function searchText(
@@ -441,12 +952,56 @@ async function searchText(
       })()
     : [...workspaceFolders()];
 
-  const hits: string[] = [];
+  type RankedHit = { rel: string; lineNo: number; text: string; score: number };
+  const ranked: RankedHit[] = [];
   const lower = query.toLowerCase();
   const include = glob && glob.trim() ? glob : "**/*";
+  const scanCap = Math.max(maxResults * 8, 120);
+
+  const activeRel = vscode.window.activeTextEditor?.document.uri
+    ? normalizeHintPath(
+        vscode.workspace.asRelativePath(
+          vscode.window.activeTextEditor.document.uri,
+          false
+        )
+      )
+    : "";
+  const openRels = new Set(
+    vscode.window.visibleTextEditors.map((ed) =>
+      normalizeHintPath(
+        vscode.workspace.asRelativePath(ed.document.uri, false)
+      )
+    )
+  );
+
+  const pathBoost = (rel: string): number => {
+    const norm = normalizeHintPath(rel);
+    let boost = 0;
+    if (activeRel && norm === activeRel) {
+      boost += 1000;
+    } else if (openRels.has(norm)) {
+      boost += 500;
+    }
+    const depth = norm.split("/").filter(Boolean).length;
+    boost += Math.max(0, 40 - depth * 4);
+    if (/\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|cs|php|rb)$/i.test(norm)) {
+      boost += 30;
+    }
+    if (/(^|\/)src\//i.test(norm)) {
+      boost += 20;
+    }
+    if (/(^|\/)(?:test|tests|__tests__)(?:\/|$)/i.test(norm)) {
+      boost -= 5;
+    }
+    const base = norm.split("/").pop() ?? norm;
+    if (lower.includes(base.replace(/\.[^.]+$/, "").toLowerCase())) {
+      boost += 80;
+    }
+    return boost;
+  };
 
   for (const folder of folders) {
-    if (hits.length >= maxResults) {
+    if (ranked.length >= scanCap) {
       break;
     }
     const pattern = new vscode.RelativePattern(folder, include);
@@ -456,18 +1011,25 @@ async function searchText(
       200
     );
     for (const file of files) {
-      if (hits.length >= maxResults) {
+      if (ranked.length >= scanCap) {
         break;
       }
       try {
         const doc = await vscode.workspace.fs.readFile(file);
         const text = Buffer.from(doc).toString("utf8");
         const lines = text.split(/\r?\n/);
+        const rel = vscode.workspace.asRelativePath(file, false);
+        const boost = pathBoost(rel);
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].toLowerCase().includes(lower)) {
-            const rel = vscode.workspace.asRelativePath(file, false);
-            hits.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
-            if (hits.length >= maxResults) {
+            const lineNo = i + 1;
+            ranked.push({
+              rel,
+              lineNo,
+              text: lines[i].trim().slice(0, 200),
+              score: boost * 10000 - lineNo,
+            });
+            if (ranked.length >= scanCap) {
               break;
             }
           }
@@ -478,27 +1040,119 @@ async function searchText(
     }
   }
 
+  ranked.sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel));
+  const hits = ranked.slice(0, maxResults);
+  for (const h of hits) {
+    rememberSearchHit(h.rel, h.lineNo);
+  }
+
   return {
     ok: true,
-    content: hits.length ? hits.join("\n") : "No matches.",
+    content: hits.length
+      ? hits.map((h) => `${h.rel}:${h.lineNo}: ${h.text}`).join("\n")
+      : "No matches.",
+  };
+}
+
+function contentGuardEnabled(): boolean {
+  return (
+    vscode.workspace
+      .getConfiguration("blossom")
+      .get<boolean>("edits.contentGuard", true) ?? true
+  );
+}
+
+async function writeScratchFile(
+  absolutePath: string,
+  displayPath: string,
+  content: string
+): Promise<ToolResult> {
+  await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+  await fs.writeFile(absolutePath, content, "utf8");
+  const bytes = Buffer.byteLength(content, "utf8");
+  const runHint = displayPath.replace(/\\/g, "/");
+  return {
+    ok: true,
+    content:
+      `Wrote scratch helper ${displayPath} (${bytes} bytes). ` +
+      `Already on disk (no Apply). Run with: py -3 ${runHint} ` +
+      `(or python ${runHint}). Optional cleanup: delete_file on the same path.`,
+  };
+}
+
+async function deleteScratchFile(
+  absolutePath: string,
+  displayPath: string
+): Promise<ToolResult> {
+  try {
+    await fs.unlink(absolutePath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") {
+      return {
+        ok: true,
+        content: `Scratch helper ${displayPath} already absent.`,
+      };
+    }
+    return {
+      ok: false,
+      content: err instanceof Error ? err.message : String(err),
+    };
+  }
+  return {
+    ok: true,
+    content: `Deleted scratch helper ${displayPath}.`,
   };
 }
 
 async function proposeWrite(
   rel: string,
   content: string,
-  rootHint?: string
+  rootHint?: string,
+  meta?: ProposeWriteMeta
 ): Promise<ToolResult> {
   if (!rel) {
     return { ok: false, content: "path is required" };
   }
   const { absolutePath, displayPath } = resolveInWorkspace(rel, rootHint);
+
+  if (isAgentScratchPath(displayPath) || isAgentScratchPath(rel)) {
+    return writeScratchFile(absolutePath, displayPath, content);
+  }
+
+  if (activeToolProfile === "research" || activeToolProfile === "minimal") {
+    return { ok: false, content: scratchWriteDeniedMessage(displayPath) };
+  }
+
   let oldContent = "";
   try {
     oldContent = await fs.readFile(absolutePath, "utf8");
   } catch {
     oldContent = "";
   }
+
+  if (contentGuardEnabled()) {
+    await warmPatchIndex();
+    const guard = validateProposedEdit({
+      relativePath: displayPath,
+      newContent: content,
+      oldContent,
+    });
+    if (!guard.allowed) {
+      return { ok: false, content: guard.reason ?? "Edit blocked by content guard." };
+    }
+    const patchGuard = validatePatchScriptEdit({
+      relativePath: displayPath,
+      newContent: content,
+      oldContent,
+    });
+    if (!patchGuard.allowed) {
+      return { ok: false, content: patchGuard.reason ?? "Edit blocked by patch script guard." };
+    }
+  }
+
+  const dryRun = validateDryRunBeforeApply(displayPath);
+
   const id = `edit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const pending: PendingEdit = {
     id,
@@ -507,11 +1161,16 @@ async function proposeWrite(
     newContent: content,
     oldContent,
     kind: "write",
+    source: meta?.source ?? "write_file",
+    replacePreview: meta?.replacePreview,
   };
   pendingEdits.set(id, pending);
+  const dryNote = dryRun.allowed
+    ? ""
+    : ` ${dryRun.reason ?? "Dry-run required before apply."}`;
   return {
     ok: true,
-    content: `Edit proposed for ${pending.relativePath}. Waiting for user approval (id=${id}).`,
+    content: `Edit proposed for ${pending.relativePath}. Waiting for approval (id=${id}).${dryNote}`,
     pendingEdit: pending,
   };
 }
@@ -520,9 +1179,99 @@ async function proposeWrite(
 export async function proposeFileEdit(
   rel: string,
   content: string,
-  rootHint?: string
+  rootHint?: string,
+  meta?: ProposeWriteMeta
 ): Promise<ToolResult> {
-  return proposeWrite(rel, content, rootHint);
+  return proposeWrite(rel, content, rootHint, {
+    source: meta?.source ?? "fence",
+    replacePreview: meta?.replacePreview,
+  });
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) {
+    return 0;
+  }
+  let count = 0;
+  let pos = 0;
+  for (;;) {
+    const i = haystack.indexOf(needle, pos);
+    if (i < 0) {
+      break;
+    }
+    count++;
+    pos = i + needle.length;
+  }
+  return count;
+}
+
+async function searchReplaceInFile(
+  rel: string,
+  oldString: string,
+  newString: string,
+  rootHint?: string,
+  replaceAll = false
+): Promise<ToolResult> {
+  if (!rel) {
+    return { ok: false, content: "path is required" };
+  }
+  if (!oldString) {
+    return { ok: false, content: "old_string is required" };
+  }
+  let absolutePath: string;
+  let displayPath: string;
+  try {
+    const resolved = resolveInWorkspace(rel, rootHint);
+    absolutePath = resolved.absolutePath;
+    displayPath = resolved.displayPath;
+  } catch (err) {
+    return {
+      ok: false,
+      content: err instanceof Error ? err.message : String(err),
+    };
+  }
+  let content = "";
+  try {
+    content = await fs.readFile(absolutePath, "utf8");
+  } catch {
+    return {
+      ok: false,
+      content: `Cannot search_replace ${displayPath}: file not found. Use write_file to create it.`,
+    };
+  }
+  const hits = countOccurrences(content, oldString);
+  if (hits === 0) {
+    return {
+      ok: false,
+      content:
+        `old_string not found in ${displayPath}. read_file the target lines and copy exact whitespace.`,
+    };
+  }
+  if (hits > 1 && !replaceAll) {
+    return {
+      ok: false,
+      content:
+        `old_string matched ${hits} times in ${displayPath}. Add surrounding lines to make it unique, or set replace_all true.`,
+    };
+  }
+  const updated = replaceAll
+    ? content.split(oldString).join(newString)
+    : content.replace(oldString, newString);
+  if (updated === content) {
+    return {
+      ok: false,
+      content: `No change in ${displayPath} (old_string equals new_string).`,
+    };
+  }
+  return proposeWrite(displayPath, updated, rootHint, {
+    source: "search_replace",
+    replacePreview: {
+      oldString,
+      newString,
+      replaceAll,
+      matchCount: hits,
+    },
+  });
 }
 
 /** Propose deleting a workspace-relative file (Apply / Auto-apply will unlink it). */
@@ -542,6 +1291,15 @@ export async function proposeFileDelete(
       content: err instanceof Error ? err.message : String(err),
     };
   }
+
+  if (isAgentScratchPath(displayPath) || isAgentScratchPath(rel)) {
+    return deleteScratchFile(absolutePath, displayPath);
+  }
+
+  if (activeToolProfile === "research" || activeToolProfile === "minimal") {
+    return { ok: false, content: scratchWriteDeniedMessage(displayPath) };
+  }
+
   let oldContent = "";
   try {
     oldContent = await fs.readFile(absolutePath, "utf8");
@@ -559,6 +1317,7 @@ export async function proposeFileDelete(
     newContent: "",
     oldContent,
     kind: "delete",
+    source: "delete",
   };
   pendingEdits.set(id, pending);
   return {
@@ -581,6 +1340,35 @@ export async function applyPendingEdit(id: string): Promise<string> {
   });
   if (!inside) {
     throw new Error("Refusing to modify files outside workspace roots.");
+  }
+
+  if (pending.kind !== "delete" && contentGuardEnabled()) {
+    await warmPatchIndex();
+    const guard = validateProposedEdit({
+      relativePath: pending.relativePath,
+      newContent: pending.newContent,
+      oldContent: pending.oldContent,
+    });
+    if (!guard.allowed) {
+      pendingEdits.delete(id);
+      throw new Error(guard.reason ?? "Edit blocked by content guard.");
+    }
+    const patchGuard = validatePatchScriptEdit({
+      relativePath: pending.relativePath,
+      newContent: pending.newContent,
+      oldContent: pending.oldContent,
+    });
+    if (!patchGuard.allowed) {
+      pendingEdits.delete(id);
+      throw new Error(patchGuard.reason ?? "Edit blocked by patch script guard.");
+    }
+  }
+
+  if (pending.kind !== "delete") {
+    const dryRun = validateDryRunBeforeApply(pending.relativePath);
+    if (!dryRun.allowed) {
+      throw new Error(dryRun.reason ?? "Dry-run required before apply.");
+    }
   }
 
   const uri = vscode.Uri.file(pending.absolutePath);
@@ -623,20 +1411,48 @@ export async function applyPendingEdit(id: string): Promise<string> {
       .get<boolean>("edits.autoSave", true) ?? true;
 
   if (autoSave) {
-    // Disk truth: always flush bytes so Auto-apply / Apply work without Ctrl+S.
-    await fs.writeFile(pending.absolutePath, pending.newContent, "utf8");
-    try {
-      const doc = await vscode.workspace.openTextDocument(uri);
-      if (doc.isDirty) {
-        await doc.save();
-      }
-    } catch {
-      // file write above is enough
-    }
+    // Save only through TextDocument.save(). Never node fs.writeFile on an
+    // open buffer — that bumps mtime behind the editor and causes
+    // "The content of the file is newer" on the next Ctrl+S.
+    await saveAppliedDocument(uri, pending.newContent);
   }
 
   pendingEdits.delete(id);
   return pending.relativePath;
+}
+
+/** Flush an applied edit to disk without fighting the open editor. */
+async function saveAppliedDocument(
+  uri: vscode.Uri,
+  content: string
+): Promise<void> {
+  const doc = await vscode.workspace.openTextDocument(uri);
+
+  // createFile({ contents }) already wrote disk — buffer should match.
+  if (!doc.isDirty && doc.getText() === content) {
+    return;
+  }
+
+  if (doc.getText() !== content) {
+    const full = new vscode.Range(
+      doc.positionAt(0),
+      doc.positionAt(doc.getText().length)
+    );
+    const fix = new vscode.WorkspaceEdit();
+    fix.replace(uri, full, content);
+    const fixed = await vscode.workspace.applyEdit(fix);
+    if (!fixed) {
+      throw new Error("VS Code rejected syncing the buffer before save");
+    }
+  }
+
+  const reopened = await vscode.workspace.openTextDocument(uri);
+  const saved = await reopened.save();
+  if (!saved && reopened.isDirty) {
+    throw new Error(
+      `Could not save ${path.basename(uri.fsPath)} — resolve any file conflict, then Apply again.`
+    );
+  }
 }
 
 export async function rejectPendingEdit(id: string): Promise<void> {
@@ -799,6 +1615,121 @@ async function peekRelated(name: string, rel: string): Promise<ToolResult> {
     ok: true,
     content: `// ${match.kind}:${match.name}/${cleanedRel}\n${text.slice(0, cfg.maxBytes)}`,
   };
+}
+
+async function runCommand(
+  command: string,
+  cwdRel: string,
+  rootHint: string | undefined,
+  timeoutMs: number
+): Promise<ToolResult> {
+  const cmd = (command || "").trim();
+  if (!cmd) {
+    return { ok: false, content: "run_command requires a non-empty command." };
+  }
+  if (cmd.length > 8000) {
+    return { ok: false, content: "Command too long (max 8000 chars)." };
+  }
+
+  const { absolutePath: cwd, displayPath } = resolveInWorkspace(
+    cwdRel || ".",
+    rootHint
+  );
+  try {
+    const st = await fs.stat(cwd);
+    if (!st.isDirectory()) {
+      return { ok: false, content: `cwd is not a directory: ${displayPath}` };
+    }
+  } catch {
+    return { ok: false, content: `cwd does not exist: ${displayPath}` };
+  }
+
+  const timeout = Math.min(
+    Math.max(1000, Math.floor(timeoutMs || RUN_COMMAND_DEFAULT_TIMEOUT_MS)),
+    RUN_COMMAND_MAX_TIMEOUT_MS
+  );
+
+  return new Promise((resolve) => {
+    const child = spawn(cmd, {
+      cwd,
+      shell: true,
+      windowsHide: true,
+      env: process.env,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timedOut = false;
+
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      const clip = (s: string) =>
+        s.length > RUN_COMMAND_MAX_OUTPUT_CHARS
+          ? `${s.slice(0, RUN_COMMAND_MAX_OUTPUT_CHARS)}\n…(truncated)`
+          : s;
+      const parts = [
+        `cwd: ${displayPath}`,
+        `command: ${cmd}`,
+        timedOut ? `status: timeout after ${timeout}ms` : `exit: ${code ?? "null"}${signal ? ` signal=${signal}` : ""}`,
+        "",
+        "--- stdout ---",
+        clip(stdout) || "(empty)",
+        "",
+        "--- stderr ---",
+        clip(stderr) || "(empty)",
+      ];
+      const ok = !timedOut && code === 0;
+      resolve({ ok, content: parts.join("\n") });
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // ignore
+      }
+      setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+      }, 2000);
+    }, timeout);
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      stdout += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      if (stdout.length > RUN_COMMAND_MAX_OUTPUT_CHARS * 2) {
+        stdout = stdout.slice(0, RUN_COMMAND_MAX_OUTPUT_CHARS);
+      }
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      if (stderr.length > RUN_COMMAND_MAX_OUTPUT_CHARS * 2) {
+        stderr = stderr.slice(0, RUN_COMMAND_MAX_OUTPUT_CHARS);
+      }
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({
+        ok: false,
+        content: `Failed to start command in ${displayPath}: ${err.message}`,
+      });
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      finish(code, signal);
+    });
+  });
 }
 
 /** Suggest related folder names that look like package / path dependencies. */

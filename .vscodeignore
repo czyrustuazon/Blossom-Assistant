@@ -6,12 +6,19 @@ tsconfig.json
 **/*.map
 **/*.ts
 !out/**/*.js
-node_modules/**
 *.md
+!README.md
 .cursor/**
 *.vsix
+*.bat
+progress.md
 icon.png
 !media/icon.png
 media/icon-128.png
 media/icon-256.png
 media/blossom-activity.png
+# Dev-only packages (runtime deps are included by vsce from package.json)
+node_modules/@types/**
+node_modules/typescript/**
+node_modules/@vscode/**
+
