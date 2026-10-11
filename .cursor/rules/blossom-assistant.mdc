@@ -26,9 +26,11 @@ Client for ChatRouter at `http://127.0.0.1:8081`. Local-first coding.
 - **Content guard** (`editGuard.ts`): block full replaces that paste README/markdown into `.py`/code files, ### path headings, plan stubs, or gut source. Blocks empty/near-empty wipes, line-ratio gutting (even when scoreCode is weak — PHP used to cap at 1 and skip all oldCode≥3 checks), structure collapse, and markdown/stub patterns (e.g. darcutil-style). Docs go in `path=*.md` fences.
 - **Dry-run gate** (`dryRunGate.ts`): block Apply/auto-apply on `patch_*.py`, `deploy_*.py`, `tools/*.py` until `python <path> --dry-run` (or smoke import) succeeds in the same turn. Toggle: `blossom.edits.dryRunGate`.
 - **Patch script guard** (`patchScriptContext.ts`): auto-scans workspace for patch scripts; injects `[PATCH SCRIPT MAP]`; blocks cross-file symbols and oversized rewrites.
+- **Decomp pack** (`decompContext.ts`): nlpp-decomp detection → `[NLPP DECOMP]` policy, compress `technical.md`/`AGENT_HANDOFF.md`, append-only `functions.toml`/`externs.toml`, block Apply during `ctrdecomp relink`, decomp-biased coding memory. Skips EngPatcher cave map in decomp trees.
 - **Ghidra read_ghidra** (`ghidra/client.ts`): HTTP client for any Ghidra MCP bridge; auto-discovers localhost ports; injects `[GHIDRA]` hint when connected. Tool: decompile/disassemble/function_info/search_functions.
 - **Analysis-first routing**: prompts with "Before making any code modifications" / Problem Analysis + Litmus → plan-only until user says implement. Saves tokens on RE tasks.
 - After coding: Summary card with model notes + backend (Local coder / Claude / Gemini). No "Done — applied…" spam.
+- **ask_user:** multiple-choice card in chat (2–6 options + Skip); agent loop pauses until the user picks. Use when stuck on real forks — not for trivia solvable with read_file.
 - **Live UX:** agent tool loop uses `streamPlain` / `streamChat` only (never `chatOnce`) so reasoning + answer tokens stream live. `model_reasoning` shows in the busy-row reasoning strip; do not add a "Thinking · N steps" trail box.
 - Link / unused-file asks:
   - Inject `[LINK CHECK]` with EXISTS/MISSING from real `fs.access`.
@@ -45,6 +47,7 @@ Client for ChatRouter at `http://127.0.0.1:8081`. Local-first coding.
 - `src/agent/editGuard.ts` — block prose-in-code / gutted full replaces
 - `src/agent/dryRunGate.ts` — require --dry-run before patch-script apply
 - `src/agent/patchScriptContext.ts` — patch file map + cross-file / cave guards
+- `src/agent/decompContext.ts` — matching-decomp policy / attach compress / TOML+relink guards
 - `src/ghidra/client.ts` — read_ghidra HTTP bridge client
 - `src/vision/caption.ts` — offline Ollama VL caption (+ OCR fallback) → `[IMAGE CAPTION — local]`
 - `src/vision/ocr.ts` — local Tesseract + optional Pillow preprocess
@@ -52,6 +55,10 @@ Client for ChatRouter at `http://127.0.0.1:8081`. Local-first coding.
 - `src/agent/tools.ts` — apply + save
 - `src/chat/ChatPanel.ts` — UI
 - `src/agent/chatArchive.ts` — saved chats under `.blossom/chats/` (History chip + agent list/search/read tools)
+- `src/memory/client.ts` — coding_lessons search inject + learn (auto + thumbs-up)
+- `src/agent/ideTools.ts` — diagnostics / symbols / definition / references
+- `src/agent/continuity.ts` — continuity layers mental model for prompts
+- `src/agent/backgroundCommands.ts` — background `run_command` jobs
 - `hand-off.md` — vision pipeline + open local roadblocks (R1–R6)
 
 Backend rules: `Documents/Blossom/PythonScripts/` — coordinate; do not duplicate disk I/O there.

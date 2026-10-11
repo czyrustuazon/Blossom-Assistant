@@ -11,6 +11,14 @@ import {
   type RepoKnowledge,
 } from "./repoKnowledge";
 import { buildPatchScriptMapBlock, userTextWantsPatchContext } from "./patchScriptContext";
+import {
+  buildDecompPolicyBlock,
+  compressDecompDocument,
+  decompAttachLimit,
+  decompTotalAttachBudget,
+  detectDecompWorkspace,
+  isHugeDecompDoc,
+} from "./decompContext";
 import { buildGhidraHintBlock } from "../ghidra/client";
 import { buildGhidraMcpHintBlock } from "../mcp/ghidraMcpClient";
 import {
@@ -292,6 +300,9 @@ export async function enrichWithEditorContext(
   const blocks: string[] = [];
   let total = 0;
   let knowledge: RepoKnowledge | null = null;
+  const decompInfo = await detectDecompWorkspace();
+  const fileCap = decompInfo ? decompAttachLimit("generic") : MAX_FILE_CHARS;
+  const totalCap = decompInfo ? decompTotalAttachBudget() : MAX_TOTAL_CHARS;
 
   if (opts?.extensionContext) {
     try {
@@ -302,13 +313,23 @@ export async function enrichWithEditorContext(
   }
 
   const addBlock = (label: string, body: string, tag: string, asPath?: string): void => {
-    if (!body.trim() || total >= MAX_TOTAL_CHARS) {
+    if (!body.trim() || total >= totalCap) {
       return;
     }
-    const clipped =
-      body.length > MAX_FILE_CHARS
-        ? `${body.slice(0, MAX_FILE_CHARS)}\n\n… truncated (${body.length} chars)`
-        : body;
+    let clipped: string;
+    if (decompInfo && isHugeDecompDoc(label)) {
+      const packed = compressDecompDocument(label, body);
+      clipped = packed.text;
+      if (packed.compressed && !attached.includes("decomp doc compress")) {
+        attached.push("decomp doc compress");
+      }
+    } else {
+      const cap = decompInfo ? decompAttachLimit(label) : fileCap;
+      clipped =
+        body.length > cap
+          ? `${body.slice(0, cap)}\n\n… truncated (${body.length} chars)`
+          : body;
+    }
     blocks.push(`<<<FILE path="${label}">>>\n${clipped}\n<<<END_FILE>>>`);
     attached.push(tag);
     if (asPath && !asPath.includes(":")) {
@@ -558,7 +579,20 @@ export async function enrichWithEditorContext(
     }
   }
 
-  const patchMap = await buildPatchScriptMapBlock(userText);
+  // Matching-decomp pack first (nlpp-decomp). Skip EngPatcher cave map when this is a decomp tree.
+  const decompPack = await buildDecompPolicyBlock(userText);
+  if (decompPack) {
+    const userIdx = parts.findIndex((p) => p === "[USER REQUEST]");
+    const insertAt = userIdx >= 0 ? userIdx : parts.length;
+    parts.splice(insertAt, 0, decompPack.block, "");
+    if (!attached.includes(decompPack.attachedLabel)) {
+      attached.push(decompPack.attachedLabel);
+    }
+  }
+
+  const patchMap = decompPack
+    ? ""
+    : await buildPatchScriptMapBlock(userText);
   if (patchMap) {
     parts.splice(
       parts.findIndex((p) => p === "[USER REQUEST]") >= 0
@@ -571,7 +605,7 @@ export async function enrichWithEditorContext(
     if (!attached.includes("patch script map")) {
       attached.push("patch script map");
     }
-  } else if (userTextWantsPatchContext(userText)) {
+  } else if (!decompPack && userTextWantsPatchContext(userText)) {
     parts.push(
       "",
       "[PATCH SCRIPT MAP]",

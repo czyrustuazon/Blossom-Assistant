@@ -71,6 +71,8 @@ export interface BlossomConfig {
       ocrFallback: boolean;
       ocrCommand: string;
       maxImages: number;
+      /** Unload Ollama models before VL to free VRAM (R1). */
+      unloadCoderFirst: boolean;
     };
   };
   siblingPeek: {
@@ -104,6 +106,29 @@ export interface BlossomConfig {
     stepMode: "off" | "confirmTools" | "planSteps";
     /** When stepMode=confirmTools, pause after this many tool rounds. */
     confirmToolsAfterRounds: number;
+    /** After tool-round cap, run one local self-critique pass before ESCALATE_*. */
+    localRetryBeforeEscalate: boolean;
+    /** Run independent read-only tools in parallel within a round. */
+    parallelTools: boolean;
+  };
+  /** Durable ChatRouter coding_lessons memory (search inject + learn). */
+  memory: {
+    enabled: boolean;
+    /** Auto-learn from a successful local turn summary. */
+    autoLearn: boolean;
+  };
+  /**
+   * Matching-decomp workspace pack (nlpp-decomp): policy inject, attach compress,
+   * append-only TOML / relink edit gates. Distinct from EngPatcher patch guards.
+   */
+  decomp: {
+    enabled: boolean;
+    /** Max chars for a single attached file when in a decomp workspace. */
+    attachMaxChars: number;
+    /** Soft budget for all FILE attaches in a decomp turn. */
+    totalAttachBudget: number;
+    /** Block Apply while `ctrdecomp relink` is running. */
+    blockDuringRelink: boolean;
   };
   ui: {
     displayName: string;
@@ -215,7 +240,19 @@ export function getConfig(): BlossomConfig {
           (cfg.get<string>("vision.caption.ocrCommand") ?? "tesseract").trim() ||
           "tesseract",
         maxImages: cfg.get<number>("vision.caption.maxImages") ?? 3,
+        unloadCoderFirst:
+          cfg.get<boolean>("vision.caption.unloadCoderFirst") ?? true,
       },
+    },
+    memory: {
+      enabled: cfg.get<boolean>("memory.enabled") ?? true,
+      autoLearn: cfg.get<boolean>("memory.autoLearn") ?? true,
+    },
+    decomp: {
+      enabled: cfg.get<boolean>("decomp.enabled") ?? true,
+      attachMaxChars: cfg.get<number>("decomp.attachMaxChars") ?? 3500,
+      totalAttachBudget: cfg.get<number>("decomp.totalAttachBudget") ?? 14_000,
+      blockDuringRelink: cfg.get<boolean>("decomp.blockDuringRelink") ?? true,
     },
     siblingPeek: {
       enabled: cfg.get<boolean>("siblingPeek.enabled") ?? true,
@@ -242,6 +279,9 @@ export function getConfig(): BlossomConfig {
         | "planSteps") ?? "off",
       confirmToolsAfterRounds:
         cfg.get<number>("agent.confirmToolsAfterRounds") ?? 3,
+      localRetryBeforeEscalate:
+        cfg.get<boolean>("agent.localRetryBeforeEscalate") ?? true,
+      parallelTools: cfg.get<boolean>("agent.parallelTools") ?? true,
     },
     ui: {
       displayName: (cfg.get<string>("ui.displayName") ?? "Blossom Assistant").trim() || "Blossom Assistant",

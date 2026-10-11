@@ -75,13 +75,15 @@ Do **not** close these by calling Gemini / Claude / Cursor cloud.
 
 **Symptoms:** Caption status → VL error; falls through to OCR or metadata; chat shows `[VISION ROADBLOCK — local]`.
 
-**Local mitigations to try:**
+**Shipped mitigation (extension):**
 
-- Smaller VL (`moondream`) and unload coder during caption (ChatRouter/Ollama process policy — not implemented yet).
-- CPU-only VL with long `timeoutMs` (slow but offline).
+- `blossom.vision.caption.unloadCoderFirst` (default true): before VL, call Ollama `keep_alive: 0` to unload listed models, and soft-POST ChatRouter `/v1/vision/pause` if present (`src/vision/unload.ts`).
+
+**Still open / local mitigations:**
+
+- Smaller VL (`moondream`); CPU-only VL with long `timeoutMs`.
 - Caption-only Ollama instance on another port; keep ChatRouter on `:8081`.
-
-**Owner gap:** Extension does not yet coordinate model unload/swap with ChatRouter.
+- ChatRouter-native unload/hot-swap if `/v1/vision/pause` is missing.
 
 ### R2 — OCR quality on dark IDE toasts
 
@@ -89,11 +91,9 @@ Do **not** close these by calling Gemini / Claude / Cursor cloud.
 
 **Symptoms:** `source: ocr` with garbled `Exact UI text`; coder trusts bad text.
 
-**Local mitigations to try:**
+**Shipped mitigation:** Pillow preprocess now invert + autocontrast + 2× upscale + soft threshold + bottom-right crop heuristic for large frames (`src/vision/ocr.ts`). OCR still labeled untrusted.
 
-- Improve preprocess (crop to toast bbox, larger upscale, threshold) before Tesseract.
-- Prefer VL; treat OCR as untrusted (`Kind: (ocr fallback — verify carefully)` already labeled).
-- UI-specific templates (toast region heuristics) — not implemented.
+**Still open:** tighter toast bbox templates; prefer VL whenever VRAM allows.
 
 ### R3 — Caption latency
 
@@ -103,7 +103,7 @@ Do **not** close these by calling Gemini / Claude / Cursor cloud.
 
 - In-memory cache keyed by `size:mtime:path` (implemented).
 - Keep VL model hot in Ollama (`keep_alive`).
-- Parallel caption for multi-image (currently sequential).
+- Parallel caption for multi-image (implemented when >1 image).
 
 ### R4 — ChatRouter has no first-class vision route
 
@@ -118,7 +118,9 @@ Do **not** close these by calling Gemini / Claude / Cursor cloud.
 
 **Problem:** History only stores “N image(s) attached” / caption text. Re-asking without re-attach relies on caption text quality.
 
-**Local mitigations:** Persist last caption in scratchpad or a small vision cache file under `.blossom/` — not implemented.
+**Shipped mitigation:** Last caption batch written to `.blossom/last-captions.json` (`loadLastCaptionBlock` / persist in `caption.ts`). Image bytes still not in chat history.
+
+**Still open:** Auto-reinject last captions when the user refers to “the screenshot” without re-attach.
 
 ### R6 — GIF / animated / huge screenshots
 
@@ -145,6 +147,21 @@ Public-internet tools for the local agent — **on by default** (set `blossom.we
 **Routing:** Need-based (local vs search vs fetch vs browser) — not “try local N times then web.” When `blossom.web.enabled` is on, Blossom searches/fetches on its own; no “search the web” phrase gate.
 
 **Key files:** `src/web/{search,fetchUrl,browser,gate}.ts`, wiring in `src/agent/tools.ts`, `prompts.ts`, `toolProtocol.ts`, `orchestrator.ts`.
+
+---
+
+## Matching decomp pack (nlpp-decomp) — 0.1.57
+
+When the workspace looks like a matching decomp (`AGENT_HANDOFF.md` + `ctrdecomp` / `functions.toml`), the extension injects `[NLPP DECOMP]` (vanilla-only, VA math, Agent A/B ownership, match loop), compresses giant `technical.md` / handoff attaches for 16k-ctx coders, skips EngPatcher cave maps, biases coding-memory retrieval toward `decomp-matching` / negative lessons, and blocks Apply on append-only TOML rewrites or while `ctrdecomp relink` is running.
+
+| Setting | Default |
+|---------|---------|
+| `blossom.decomp.enabled` | `true` |
+| `blossom.decomp.attachMaxChars` | `3500` |
+| `blossom.decomp.totalAttachBudget` | `14000` |
+| `blossom.decomp.blockDuringRelink` | `true` |
+
+**Key file:** `src/agent/decompContext.ts`. ChatRouter still owns `n_ctx` / Chroma seed size — raise context or reseed `docs/rag_seeds/` on the Blossom side if prompts still overflow.
 
 ---
 

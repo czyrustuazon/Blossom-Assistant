@@ -247,6 +247,16 @@ export function summarizeToolResultOneLine(entry: ToolTranscriptEntry): string {
     }
     case "list_dir":
       return `${base}: listed ${entry.result.split("\n").length - 1} entries`;
+    case "ask_user": {
+      const choice = entry.result.match(/^Choice:\s*(.+)$/m)?.[1];
+      if (choice) {
+        return `${base}: ${choice.slice(0, 100)}`;
+      }
+      if (/skipped/i.test(entry.result)) {
+        return `${base}: skipped`;
+      }
+      return `${base}: answered`;
+    }
     case "run_command": {
       const exit = entry.result.match(/^exit: (.+)$/m)?.[1] ?? "?";
       return `${base}: exit ${exit.trim()}`;

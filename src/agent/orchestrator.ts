@@ -21,6 +21,20 @@ import {
 } from "../chat/attachments";
 import { captionImageAttachments } from "../vision/caption";
 import {
+  fetchCodingMemoryForPrompt,
+  learnCodingLesson,
+} from "../memory/client";
+import {
+  decompMemoryQuery,
+  detectDecompWorkspace,
+} from "./decompContext";
+import { formatContinuityBrief } from "./continuity";
+import {
+  looksLikeDocsResearch,
+  maybePrefetchResearchBrief,
+  prependResearchBrief,
+} from "../research/client";
+import {
   buildSystemPrompt,
   detectPromptTier,
   ensureChatRouterCodingRoute,
@@ -73,6 +87,8 @@ import {
 import {
   applyPendingEdit,
   clearSearchLineHints,
+  isParallelSafeTool,
+  normalizeAskUserArgs,
   proposeFileDelete,
   proposeFileEdit,
   rejectPendingEdit,
@@ -82,6 +98,7 @@ import {
   suggestRelatedFolders,
   toolsForProfile,
   type PendingEdit,
+  type ToolResult,
 } from "./tools";
 import {
   addCommandToAllowlist,
@@ -101,6 +118,7 @@ import {
 } from "../web/gate";
 import {
   buildChatRouterAgentTurn,
+  buildLocalRetryPrompt,
   parseToolCallFences,
   stripToolCallFences,
   toOllamaToolCalls,
@@ -153,6 +171,16 @@ export interface OrchestratorEvents {
   onStepResolved?: (
     id: string,
     result: { decision: "continue" | "stop"; detail: string }
+  ) => void;
+  /** Multiple-choice ask_user card (agent loop pauses). */
+  onPendingAskUser?: (req: {
+    id: string;
+    question: string;
+    options: string[];
+  }) => void;
+  onAskUserResolved?: (
+    id: string,
+    result: { detail: string; skipped?: boolean }
   ) => void;
   onPendingEdit: (
     edit: PendingEdit,
@@ -218,6 +246,11 @@ interface LiveEditSession {
 }
 
 export type StepDecision = "continue" | "stop";
+
+/** ask_user card: option index (0-based) or skip. */
+export type AskUserDecision =
+  | { kind: "choice"; index: number }
+  | { kind: "skip" };
 
 function isAbortLike(err: unknown): boolean {
   if (!err || typeof err !== "object") {
@@ -304,6 +337,11 @@ export class AgentOrchestrator {
     (decision: StepDecision) => void
   >();
   private stepSeq = 0;
+  private readonly pendingAskUsers = new Map<
+    string,
+    (decision: AskUserDecision) => void
+  >();
+  private askUserSeq = 0;
   /** Edits held until python --dry-run verifies patch scripts (same turn). */
   private readonly dryRunBlockedEdits = new Map<string, PendingEdit>();
   /** Host scratchpad necessity for the in-flight coding turn. */
@@ -587,6 +625,7 @@ export class AgentOrchestrator {
     this.abort?.abort();
     this.rejectAllPendingCommands();
     this.rejectAllPendingSteps();
+    this.rejectAllPendingAskUsers();
     this.clearContextInjectState();
   }
 
@@ -610,6 +649,16 @@ export class AgentOrchestrator {
     resolve(decision);
   }
 
+  /** Resolve an ask_user multiple-choice card. */
+  resolveAskUser(id: string, decision: AskUserDecision): void {
+    const resolve = this.pendingAskUsers.get(id);
+    if (!resolve) {
+      return;
+    }
+    this.pendingAskUsers.delete(id);
+    resolve(decision);
+  }
+
   private rejectAllPendingCommands(): void {
     for (const [id, resolve] of this.pendingCommands) {
       this.pendingCommands.delete(id);
@@ -622,6 +671,81 @@ export class AgentOrchestrator {
       this.pendingSteps.delete(id);
       resolve("stop");
     }
+  }
+
+  private rejectAllPendingAskUsers(): void {
+    for (const [id, resolve] of this.pendingAskUsers) {
+      this.pendingAskUsers.delete(id);
+      resolve({ kind: "skip" });
+    }
+  }
+
+  /**
+   * Pause for a multiple-choice ask_user card; returns a tool result for the transcript.
+   */
+  private async promptAskUser(
+    args: Record<string, unknown>,
+    events: OrchestratorEvents,
+    signal: AbortSignal
+  ): Promise<ToolResult> {
+    const normalized = normalizeAskUserArgs(args);
+    if (!normalized.ok) {
+      return { ok: false, content: normalized.content };
+    }
+    const { question, options } = normalized;
+    const id = `ask-${++this.askUserSeq}-${Date.now()}`;
+    const letters = "ABCDEF";
+    events.onStreamBreak?.();
+    events.onPendingAskUser?.({ id, question, options });
+    events.onStatus("Waiting for your choice…");
+    events.onTool(
+      "ask_user",
+      `${question.slice(0, 80)}${question.length > 80 ? "…" : ""} (${options.length} options)`
+    );
+
+    const decision = await new Promise<AskUserDecision>((resolve) => {
+      this.pendingAskUsers.set(id, resolve);
+      if (signal.aborted) {
+        this.pendingAskUsers.delete(id);
+        resolve({ kind: "skip" });
+        return;
+      }
+      const onAbort = () => {
+        if (this.pendingAskUsers.has(id)) {
+          this.pendingAskUsers.delete(id);
+          resolve({ kind: "skip" });
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+
+    if (decision.kind === "skip") {
+      const detail =
+        "Skipped — no choice selected. Agent should not assume a preference.";
+      events.onAskUserResolved?.(id, { detail, skipped: true });
+      return {
+        ok: true,
+        content: [
+          "User skipped ask_user (no choice selected).",
+          `Question: ${question}`,
+          "Do not assume a preference; either state a safe default explicitly, or call ask_user again with clearer options.",
+        ].join("\n"),
+      };
+    }
+
+    const idx = Math.max(0, Math.min(options.length - 1, decision.index));
+    const letter = letters[idx] || String(idx + 1);
+    const label = options[idx];
+    const detail = `Chose ${letter}: ${label}`;
+    events.onAskUserResolved?.(id, { detail });
+    return {
+      ok: true,
+      content: [
+        "User answered ask_user.",
+        `Question: ${question}`,
+        `Choice: ${letter} — ${label}`,
+      ].join("\n"),
+    };
   }
 
   /**
@@ -774,6 +898,17 @@ export class AgentOrchestrator {
       return one.length > max ? `${one.slice(0, max)}…` : one;
     };
 
+    if (name === "ask_user") {
+      const q = str("question") || str("prompt");
+      const opts = Array.isArray(obj.options)
+        ? obj.options.length
+        : Array.isArray(obj.choices)
+          ? obj.choices.length
+          : 0;
+      return opts > 0
+        ? `${clipOneLine(q, 90)}\n${opts} option(s)`
+        : clipOneLine(q, 100);
+    }
     if (name === "run_command") {
       const command = str("command");
       const cwd = str("cwd") || ".";
@@ -1248,8 +1383,36 @@ export class AgentOrchestrator {
         events.onStatus("Scratchpad required for this task — agent will maintain notes");
       }
 
+      const decompWs = await detectDecompWorkspace();
+      const memoryQuery = decompWs
+        ? decompMemoryQuery(userText)
+        : userText;
+      const memoryHits = await fetchCodingMemoryForPrompt(
+        memoryQuery,
+        decompWs ? 6 : 4
+      );
+      if (memoryHits.block) {
+        events.onStatus(
+          decompWs
+            ? `Coding memory (decomp): ${memoryHits.count} lesson(s).`
+            : `Coding memory: ${memoryHits.count} lesson(s) for this ask.`
+        );
+        events.onTool("coding_memory", `${memoryHits.count} hit(s)`);
+      }
+      const continuityBrief = formatContinuityBrief({
+        hasScratchpad: Boolean(getScratchpad(this.context).trim()),
+        memoryHitCount: memoryHits.count,
+        archiveHint: true,
+      });
+
       const system = await buildSystemPrompt();
-      let promptUser = enriched.promptText;
+      let promptUser = [
+        continuityBrief,
+        memoryHits.block,
+        enriched.promptText,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       if (cfg.backend === "chatRouter") {
         // ChatRouter drops extension system prompts — inject protocol into the user turn.
         promptUser = sequentialMode
@@ -1277,6 +1440,12 @@ export class AgentOrchestrator {
           promptUser,
           this.historySummary,
           this.history
+        );
+        promptUser = await this.injectResearchBriefIfNeeded(
+          promptUser,
+          userText,
+          events,
+          signal
         );
       }
       const messages: OllamaMessage[] =
@@ -1550,6 +1719,22 @@ export class AgentOrchestrator {
         events.onCodingSummary(summary);
       }
 
+      if (
+        getConfig().memory.enabled &&
+        getConfig().memory.autoLearn &&
+        finalText.trim().length > 80 &&
+        !escalateReason
+      ) {
+        const learn = await learnCodingLesson({
+          userPrompt: userText,
+          answer: finalText,
+          source: "blossom_assistant_local",
+        });
+        if (learn.stored) {
+          events.onStatus("Saved coding lesson to local memory.");
+        }
+      }
+
       this.flushTurnContextInjectsToHistory();
       this.history.push({ role: "assistant", content: finalText });
       await this.maintainSessionHistory(events, userText);
@@ -1652,6 +1837,12 @@ export class AgentOrchestrator {
           promptUser,
           this.historySummary,
           this.history
+        );
+        promptUser = await this.injectResearchBriefIfNeeded(
+          promptUser,
+          snap.userText,
+          events,
+          signal
         );
       }
       const messages: OllamaMessage[] =
@@ -2021,6 +2212,33 @@ export class AgentOrchestrator {
       },
       onStatus: (text) => opts.events.onStatus(text),
     });
+  }
+
+  /**
+   * Docs/version/API asks: POST ChatRouter /v1/research and prepend brief
+   * before the tool loop. Soft-fail; no TS planner/search.
+   */
+  private async injectResearchBriefIfNeeded(
+    promptUser: string,
+    userText: string,
+    events: OrchestratorEvents,
+    signal: AbortSignal
+  ): Promise<string> {
+    if (!looksLikeDocsResearch(userText)) {
+      return promptUser;
+    }
+    events.onStatus("Research pipeline (docs/API)…");
+    const pref = await maybePrefetchResearchBrief(userText, signal);
+    if (signal.aborted || !pref.brief) {
+      return promptUser;
+    }
+    const src =
+      pref.sourceCount > 0 ? `, ${pref.sourceCount} source(s)` : "";
+    events.onTool("research", `${pref.mode}${src}`);
+    events.onStatus(
+      `Research brief ready (${pref.mode}${src}) — coding with cited context…`
+    );
+    return prependResearchBrief(promptUser, pref.brief);
   }
 
   /**
@@ -2407,7 +2625,10 @@ export class AgentOrchestrator {
         transcript,
         round,
         maxToolRounds,
-        { scratchpadHint: scratchHint }
+        {
+          scratchpadHint: scratchHint,
+          lastAssistantProse: lastContent || undefined,
+        }
       );
       if (injectBlock && !chatRouter) {
         ollamaMessages.push({ role: "user", content: injectBlock });
@@ -2473,6 +2694,10 @@ export class AgentOrchestrator {
           ? result.toolCalls
           : toOllamaToolCalls(parseToolCallFences(result.content || ""));
 
+      // Seal this round's prose into its own bubble before tools / next round /
+      // final return — otherwise every round appends into one plain-text panel.
+      events.onStreamBreak?.();
+
       if (toolCalls.length > 0) {
         const visible = stripToolCallFences(result.content || "");
         if (visible) {
@@ -2481,6 +2706,7 @@ export class AgentOrchestrator {
           // Skip replay when streamPlain already pushed those tokens to the UI.
           if (!result.alreadyStreamed) {
             await this.replayContentWithLiveFences(visible, events, live);
+            events.onStreamBreak?.();
           }
         }
 
@@ -2492,7 +2718,13 @@ export class AgentOrchestrator {
           });
         }
 
-        let producedEdit = false;
+        type PreparedCall = {
+          name: string;
+          args: Record<string, unknown>;
+          commandGate?: "allowlisted" | "approved" | "denied";
+          skip?: boolean;
+        };
+        const prepared: PreparedCall[] = [];
         for (const call of toolCalls) {
           if (signal.aborted) {
             break;
@@ -2544,6 +2776,7 @@ export class AgentOrchestrator {
               if (!chatRouter) {
                 ollamaMessages.push({ role: "tool", content: denied });
               }
+              prepared.push({ name, args, commandGate, skip: true });
               continue;
             }
           }
@@ -2568,46 +2801,68 @@ export class AgentOrchestrator {
                 result: denied,
                 ok: false,
               });
-              this.turnToolFailureNotes.push(
-                `${name} denied`.slice(0, 160)
-              );
+              this.turnToolFailureNotes.push(`${name} denied`.slice(0, 160));
               if (!chatRouter) {
                 ollamaMessages.push({ role: "tool", content: denied });
               }
+              prepared.push({ name, args, skip: true });
               continue;
             }
           }
 
-          // Diff / delete cards are the UI for edits — skip terse tool rows.
-          // Approval card already shows the command; only log allowlisted / other tools.
+          prepared.push({ name, args, commandGate });
+        }
+
+        const runnable = prepared.filter((p) => !p.skip);
+        const parallelOn = cfg.agent.parallelTools !== false;
+        const parallelBatch = parallelOn
+          ? runnable.filter((p) => isParallelSafeTool(p.name))
+          : [];
+        const sequentialBatch = parallelOn
+          ? runnable.filter((p) => !isParallelSafeTool(p.name))
+          : runnable;
+
+        let producedEdit = false;
+
+        const executeOne = async (
+          p: PreparedCall
+        ): Promise<{ producedEdit: boolean }> => {
+          const { name, args, commandGate } = p;
           const editToolUi =
             name === "search_replace" ||
             name === "write_file" ||
             name === "delete_file";
           if (
             !editToolUi &&
+            name !== "ask_user" &&
             (name !== "run_command" || commandGate === "allowlisted")
           ) {
             events.onTool(name, this.toolDetailForUi(name, args));
           }
           events.onStatus(
-            name === "run_command"
-              ? `Running: ${String(args.command ?? "").trim()}…`
-              : isWebTool(name)
-                ? webStatusLabel(name)
-                : `Running ${name}…`
+            name === "ask_user"
+              ? "Waiting for your choice…"
+              : name === "run_command"
+                ? `Running: ${String(args.command ?? "").trim()}…`
+                : isWebTool(name)
+                  ? webStatusLabel(name)
+                  : `Running ${name}…`
           );
-          const toolResult = await runTool(name, args);
+          const toolResult =
+            name === "ask_user"
+              ? await this.promptAskUser(args, events, signal)
+              : await runTool(name, args);
+          let edit = false;
           if (name === "run_command" && toolResult.ok) {
             const cmd = String(args.command ?? "").trim();
             const verified = markDryRunFromCommand(cmd, true);
-            for (const p of verified) {
-              events.onStatus(`Dry-run OK for ${p}.`);
-              await this.flushDryRunBlockedEdits(p, events, applyNow);
+            for (const path of verified) {
+              events.onStatus(`Dry-run OK for ${path}.`);
+              await this.flushDryRunBlockedEdits(path, events, applyNow);
             }
           }
           if (toolResult.pendingEdit) {
-            producedEdit = true;
+            edit = true;
             onEditCollected?.(toolResult.pendingEdit);
             await this.deliverPendingEdit(
               toolResult.pendingEdit,
@@ -2622,7 +2877,6 @@ export class AgentOrchestrator {
             result: toolResult.content,
             ok: toolResult.ok,
           };
-          // Compact once — ChatRouter transcript + Ollama tool messages share this text.
           const compacted = compactToolResult(entry);
           transcript.push({ ...entry, result: compacted });
           if (!toolResult.ok) {
@@ -2639,6 +2893,34 @@ export class AgentOrchestrator {
               role: "tool",
               content: compacted,
             });
+          }
+          return { producedEdit: edit };
+        };
+
+        if (parallelBatch.length > 1) {
+          events.onStatus(
+            `Running ${parallelBatch.length} read tools in parallel…`
+          );
+          const results = await Promise.all(
+            parallelBatch.map((p) => executeOne(p))
+          );
+          if (results.some((r) => r.producedEdit)) {
+            producedEdit = true;
+          }
+        } else if (parallelBatch.length === 1) {
+          const r = await executeOne(parallelBatch[0]);
+          if (r.producedEdit) {
+            producedEdit = true;
+          }
+        }
+
+        for (const p of sequentialBatch) {
+          if (signal.aborted) {
+            break;
+          }
+          const r = await executeOne(p);
+          if (r.producedEdit) {
+            producedEdit = true;
           }
         }
 
@@ -2687,9 +2969,155 @@ export class AgentOrchestrator {
     }
 
     events.onStatus("Tool round limit reached");
+
+    // Offline try-harder: one local self-critique pass before cloud escalate.
+    if (cfg.agent.localRetryBeforeEscalate !== false && !signal.aborted) {
+      events.onStatus("Local retry before escalate — self-critique pass…");
+      const retryPacked = buildLocalRetryPrompt(
+        baseUserPrompt,
+        transcript,
+        lastContent
+      );
+      const retryMessages: OllamaMessage[] = chatRouter
+        ? [{ role: "user", content: retryPacked }]
+        : [
+            ...ollamaMessages,
+            {
+              role: "user",
+              content:
+                "LOCAL RETRY before escalate: finish with evidence above or emit at most 3 new tool_call fences. Do not escalate.",
+            },
+          ];
+      const retryStreamed = await this.streamPlain(
+        model,
+        retryMessages,
+        events,
+        signal,
+        live,
+        sequentialMode,
+        chatRouter ? undefined : loopTools
+      );
+      events.onStreamBreak?.();
+      const retryCalls =
+        retryStreamed.toolCalls.length > 0
+          ? retryStreamed.toolCalls
+          : toOllamaToolCalls(parseToolCallFences(retryStreamed.content || ""));
+      if (retryCalls.length > 0 && retryCalls.length <= 3) {
+        events.onStatus(
+          `Local retry: running ${retryCalls.length} follow-up tool(s)…`
+        );
+        for (const call of retryCalls) {
+          if (signal.aborted) {
+            break;
+          }
+          const name = call.function.name;
+          const args =
+            typeof call.function.arguments === "string"
+              ? (() => {
+                  try {
+                    return JSON.parse(call.function.arguments) as Record<
+                      string,
+                      unknown
+                    >;
+                  } catch {
+                    return { value: call.function.arguments };
+                  }
+                })()
+              : call.function.arguments || {};
+          if (name === "run_command") {
+            const gate = await this.confirmRunCommand(
+              String(args.command ?? "").trim(),
+              args.cwd != null ? String(args.cwd) : ".",
+              args.root != null ? String(args.root) : undefined,
+              events,
+              signal
+            );
+            if (gate === "denied") {
+              continue;
+            }
+          }
+          if (isWebTool(name)) {
+            const allowed = await confirmWebUse(
+              name,
+              this.toolDetailForUi(name, args),
+              { fastMode: this.fastMode, signal }
+            );
+            if (!allowed) {
+              continue;
+            }
+          }
+          if (name !== "ask_user") {
+            events.onTool(name, this.toolDetailForUi(name, args));
+          }
+          const toolResult =
+            name === "ask_user"
+              ? await this.promptAskUser(args, events, signal)
+              : await runTool(name, args);
+          if (toolResult.pendingEdit) {
+            onEditCollected?.(toolResult.pendingEdit);
+            await this.deliverPendingEdit(
+              toolResult.pendingEdit,
+              events,
+              applyNow
+            );
+          }
+          const entry: ToolTranscriptEntry = {
+            round: maxToolRounds + 1,
+            name,
+            args,
+            result: toolResult.content,
+            ok: toolResult.ok,
+          };
+          transcript.push({ ...entry, result: compactToolResult(entry) });
+        }
+        // One finish pass after bonus tools
+        const finishPacked = buildChatRouterAgentTurn(
+          baseUserPrompt,
+          transcript,
+          maxToolRounds,
+          maxToolRounds + 1,
+          {
+            scratchpadHint: formatScratchpadContinueHint(
+              this.turnScratchpadNeed,
+              getScratchpad(this.context)
+            ),
+            lastAssistantProse: lastContent || undefined,
+          }
+        );
+        const finishMessages: OllamaMessage[] = chatRouter
+          ? [{ role: "user", content: finishPacked }]
+          : ollamaMessages;
+        const finishStreamed = await this.streamPlain(
+          model,
+          finishMessages,
+          events,
+          signal,
+          live,
+          sequentialMode,
+          chatRouter ? undefined : loopTools
+        );
+        events.onStreamBreak?.();
+        lastContent = stripToolCallFences(finishStreamed.content || lastContent);
+        if (!/ESCALATE_/i.test(lastContent) && lastContent.trim()) {
+          return { content: lastContent, intelSource, feedbackId };
+        }
+      } else {
+        lastContent = stripToolCallFences(
+          retryStreamed.content || lastContent
+        );
+        if (
+          lastContent.trim() &&
+          !/ESCALATE_/i.test(lastContent) &&
+          (/###\s*Summary/i.test(lastContent) || lastContent.length > 200)
+        ) {
+          return { content: lastContent, intelSource, feedbackId };
+        }
+      }
+    }
+
     if (!/ESCALATE_GEMINI:/i.test(lastContent)) {
       lastContent +=
-        "\n\nESCALATE_GEMINI: Reached tool round limit without a complete answer.";
+        "\n\nESCALATE_GEMINI: Reached tool round limit without a complete answer after local retry.";
     }
     return {
       content: stripToolCallFences(lastContent),

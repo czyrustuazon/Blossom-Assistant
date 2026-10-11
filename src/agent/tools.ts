@@ -6,6 +6,7 @@ import { getConfig } from "../config";
 import type { OllamaTool } from "../ollama/client";
 import { validateProposedEdit } from "./editGuard";
 import { validatePatchScriptEdit, warmPatchIndex } from "./patchScriptContext";
+import { validateDecompEditGate } from "./decompContext";
 import { validateDryRunBeforeApply } from "./dryRunGate";
 import { readGhidra, type ReadGhidraAction } from "../ghidra/client";
 import { callGhidraMcpTool } from "../mcp/ghidraMcpClient";
@@ -37,6 +38,18 @@ import {
   browserSnapshot,
   browserType,
 } from "../web/browser";
+import {
+  awaitBackgroundCommand,
+  listBackgroundCommands,
+  startBackgroundCommand,
+} from "./backgroundCommands";
+import {
+  findReferences,
+  getDiagnostics,
+  getDocumentSymbols,
+  goToDefinition,
+} from "./ideTools";
+import { searchCodingLessons } from "../memory/client";
 
 const RUN_COMMAND_DEFAULT_TIMEOUT_MS = 60_000;
 const RUN_COMMAND_MAX_TIMEOUT_MS = 180_000;
@@ -111,6 +124,8 @@ const MINIMAL_TOOL_NAMES = new Set([
   "read_file",
   "search_text",
   "search_replace",
+  "get_diagnostics",
+  "ask_user",
 ]);
 
 /** Plan / research — inspect + verify; scratch write/delete only (gated in propose*). */
@@ -120,6 +135,8 @@ const RESEARCH_TOOL_NAMES = new Set([
   "read_file",
   "search_text",
   "run_command",
+  "await_background_command",
+  "list_background_commands",
   "write_file",
   "delete_file",
   "read_ghidra",
@@ -129,7 +146,76 @@ const RESEARCH_TOOL_NAMES = new Set([
   "list_chat_history",
   "read_chat_history",
   "search_chat_history",
+  "search_coding_memory",
+  "get_diagnostics",
+  "get_document_symbols",
+  "go_to_definition",
+  "find_references",
+  "ask_user",
 ]);
+
+/** Max choices shown on an ask_user card (A–F). */
+export const ASK_USER_MAX_OPTIONS = 6;
+
+export type NormalizedAskUser =
+  | { ok: true; question: string; options: string[] }
+  | { ok: false; content: string };
+
+/** Validate/normalize ask_user tool args for the host choice card. */
+export function normalizeAskUserArgs(
+  args: Record<string, unknown>
+): NormalizedAskUser {
+  const question = String(args.question ?? args.prompt ?? "").trim();
+  if (!question) {
+    return { ok: false, content: "ask_user requires a non-empty question." };
+  }
+  let raw = args.options ?? args.choices ?? args.answers;
+  let options: string[] = [];
+  if (Array.isArray(raw)) {
+    options = raw.map((o) => String(o ?? "").trim()).filter(Boolean);
+  } else if (typeof raw === "string") {
+    options = raw
+      .split(/\r?\n|;|\|/)
+      .map((o) => o.replace(/^\s*[A-Fa-f0-9][.):\-]\s*/, "").trim())
+      .filter(Boolean);
+  }
+  if (options.length < 2) {
+    return {
+      ok: false,
+      content: "ask_user needs at least 2 options (got fewer).",
+    };
+  }
+  if (options.length > ASK_USER_MAX_OPTIONS) {
+    options = options.slice(0, ASK_USER_MAX_OPTIONS);
+  }
+  return { ok: true, question, options };
+}
+
+/** Read-only tools safe to run concurrently in one agent round. */
+const PARALLEL_SAFE_TOOL_NAMES = new Set([
+  "list_workspace_roots",
+  "list_dir",
+  "read_file",
+  "search_text",
+  "list_related",
+  "peek_related",
+  "list_siblings",
+  "peek_sibling",
+  "list_chat_history",
+  "read_chat_history",
+  "search_chat_history",
+  "search_coding_memory",
+  "get_diagnostics",
+  "get_document_symbols",
+  "go_to_definition",
+  "find_references",
+  "list_background_commands",
+  "read_ghidra",
+]);
+
+export function isParallelSafeTool(name: string): boolean {
+  return PARALLEL_SAFE_TOOL_NAMES.has(name);
+}
 
 /** Aliases kept in runTool for back-compat but omitted from catalogs. */
 const CATALOG_ALIAS_NAMES = new Set(["list_siblings", "peek_sibling"]);
@@ -321,6 +407,104 @@ export const AGENT_TOOLS: OllamaTool[] = [
   {
     type: "function",
     function: {
+      name: "search_coding_memory",
+      description:
+        "Search durable coding lessons (ChatRouter Chroma). Use for past takeaways about this stack/repo — not a substitute for reading current files.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "What to recall (bug pattern, convention, API).",
+          },
+          n: {
+            type: "number",
+            description: "Max lessons to return (default 5).",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_diagnostics",
+      description:
+        "Read VS Code Problems/diagnostics (errors/warnings) for a file or the whole workspace. Prefer this over guessing compile errors.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description:
+              "Optional workspace-relative file. Omit for all workspace diagnostics.",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_document_symbols",
+      description:
+        "List outline/symbols for a file via the language service (functions, classes, etc.).",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Workspace-relative file path.",
+          },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "go_to_definition",
+      description:
+        "Resolve go-to-definition at path:line (1-based). Optional character column.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative file." },
+          line: { type: "number", description: "1-based line number." },
+          character: {
+            type: "number",
+            description: "1-based column (default 1).",
+          },
+        },
+        required: ["path", "line"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_references",
+      description:
+        "Find references to the symbol at path:line via the language service.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative file." },
+          line: { type: "number", description: "1-based line number." },
+          character: {
+            type: "number",
+            description: "1-based column (default 1).",
+          },
+        },
+        required: ["path", "line"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "list_dir",
       description:
         "List files and folders. Path is relative to a workspace root. In multi-root workspaces use 'RootName/subdir' or pass root.",
@@ -388,6 +572,29 @@ export const AGENT_TOOLS: OllamaTool[] = [
           maxResults: { type: "number" },
         },
         required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ask_user",
+      description:
+        "Pause and show the user a multiple-choice card in chat when you are stuck between real forks (role, approach, which file/path, risky command). Provide 2–6 short options. Do not use for trivia you can resolve with read_file/search_text. Wait for the host result before continuing.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: {
+            type: "string",
+            description: "One clear question shown on the card.",
+          },
+          options: {
+            type: "array",
+            items: { type: "string" },
+            description: "2–6 concise choices (labels A, B, C… in the UI).",
+          },
+        },
+        required: ["question", "options"],
       },
     },
   },
@@ -595,7 +802,8 @@ export const AGENT_TOOLS: OllamaTool[] = [
         "Run a shell command inside a workspace root (full shell: python, tests, git status, etc.). " +
         "Use during RESEARCH to reproduce bugs, run tests, or probe with short Python. " +
         "cwd must stay inside a workspace root (not disk siblings). " +
-        "On Windows prefer `py -3` or `python` for Python. Output is truncated; long jobs time out.",
+        "On Windows prefer `py -3` or `python` for Python. " +
+        "Set background=true for long jobs (dev servers, watches) and poll with await_background_command.",
       parameters: {
         type: "object",
         properties: {
@@ -614,11 +822,47 @@ export const AGENT_TOOLS: OllamaTool[] = [
           },
           timeout_ms: {
             type: "number",
-            description: "Optional timeout in ms (default 60000, max 180000).",
+            description:
+              "Optional timeout in ms (foreground default 60000 max 180000; background default 300000).",
+          },
+          background: {
+            type: "boolean",
+            description:
+              "If true, start the command in the background and return a job_id immediately.",
           },
         },
         required: ["command"],
       },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "await_background_command",
+      description:
+        "Wait for a background run_command job (or poll status). Pass job_id from a background start.",
+      parameters: {
+        type: "object",
+        properties: {
+          job_id: {
+            type: "string",
+            description: "Job id from run_command background=true.",
+          },
+          wait_ms: {
+            type: "number",
+            description: "How long to wait before returning (default 120000).",
+          },
+        },
+        required: ["job_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_background_commands",
+      description: "List background shell jobs started this session.",
+      parameters: { type: "object", properties: {} },
     },
   },
   {
@@ -961,6 +1205,73 @@ export async function runTool(
           }),
         };
       }
+      case "search_coding_memory": {
+        const query = String(args.query ?? "").trim();
+        if (!query) {
+          return { ok: false, content: "search_coding_memory requires query." };
+        }
+        const n =
+          typeof args.n === "number" && args.n > 0
+            ? Math.min(Math.floor(args.n), 12)
+            : 5;
+        const result = await searchCodingLessons(query, n);
+        if (!result.ok) {
+          return {
+            ok: false,
+            content:
+              "Coding memory unavailable (ChatRouter /v1/memory/coding soft-fail).",
+          };
+        }
+        if (!result.memories.length) {
+          return { ok: true, content: `No coding memory hits for: ${query}` };
+        }
+        const lines = result.memories.map(
+          (m, i) =>
+            `${i + 1}. ${(m.text || "").trim().replace(/\s+/g, " ").slice(0, 800)}`
+        );
+        return {
+          ok: true,
+          content: [`Coding memory (${result.count}):`, ...lines].join("\n"),
+        };
+      }
+      case "get_diagnostics":
+        return {
+          ok: true,
+          content: await getDiagnostics(
+            args.path != null ? String(args.path) : undefined
+          ),
+        };
+      case "get_document_symbols":
+        return {
+          ok: true,
+          content: await getDocumentSymbols(String(args.path ?? "")),
+        };
+      case "go_to_definition":
+        return {
+          ok: true,
+          content: await goToDefinition(
+            String(args.path ?? ""),
+            typeof args.line === "number" ? args.line : Number(args.line),
+            typeof args.character === "number"
+              ? args.character
+              : args.character != null
+                ? Number(args.character)
+                : undefined
+          ),
+        };
+      case "find_references":
+        return {
+          ok: true,
+          content: await findReferences(
+            String(args.path ?? ""),
+            typeof args.line === "number" ? args.line : Number(args.line),
+            typeof args.character === "number"
+              ? args.character
+              : args.character != null
+                ? Number(args.character)
+                : undefined
+          ),
+        };
       case "list_dir":
         return await listDir(
           String(args.path ?? "."),
@@ -1009,17 +1320,51 @@ export async function runTool(
           String(args.sibling ?? args.name ?? ""),
           String(args.path ?? ".")
         );
-      case "run_command":
-        return await runCommand(
-          String(args.command ?? ""),
-          args.cwd != null ? String(args.cwd) : ".",
-          args.root ? String(args.root) : undefined,
+      case "ask_user":
+        return {
+          ok: false,
+          content:
+            "ask_user is handled by the host UI (choice card). Re-emit the tool_call if the card did not appear.",
+        };
+      case "run_command": {
+        const timeout =
           typeof args.timeout_ms === "number"
             ? args.timeout_ms
             : typeof args.timeoutMs === "number"
               ? args.timeoutMs
-              : RUN_COMMAND_DEFAULT_TIMEOUT_MS
+              : undefined;
+        if (Boolean(args.background)) {
+          const cwdRel = args.cwd != null ? String(args.cwd) : ".";
+          const rootHint = args.root ? String(args.root) : undefined;
+          const { absolutePath, displayPath } = resolveInWorkspace(
+            cwdRel,
+            rootHint
+          );
+          return await startBackgroundCommand({
+            command: String(args.command ?? ""),
+            cwdAbsolute: absolutePath,
+            cwdDisplay: displayPath,
+            timeoutMs: timeout ?? 300_000,
+          });
+        }
+        return await runCommand(
+          String(args.command ?? ""),
+          args.cwd != null ? String(args.cwd) : ".",
+          args.root ? String(args.root) : undefined,
+          timeout ?? RUN_COMMAND_DEFAULT_TIMEOUT_MS
         );
+      }
+      case "await_background_command":
+        return await awaitBackgroundCommand(
+          String(args.job_id ?? args.jobId ?? ""),
+          typeof args.wait_ms === "number"
+            ? args.wait_ms
+            : typeof args.waitMs === "number"
+              ? args.waitMs
+              : 120_000
+        );
+      case "list_background_commands":
+        return listBackgroundCommands();
       case "ghidra_mcp": {
         let mcpArgs: Record<string, unknown> = {};
         const rawArgs = args.arguments ?? args.args;
@@ -1392,6 +1737,14 @@ async function proposeWrite(
     if (!patchGuard.allowed) {
       return { ok: false, content: patchGuard.reason ?? "Edit blocked by patch script guard." };
     }
+    const decompGuard = await validateDecompEditGate({
+      relativePath: displayPath,
+      newContent: content,
+      oldContent,
+    });
+    if (!decompGuard.allowed) {
+      return { ok: false, content: decompGuard.reason ?? "Edit blocked by decomp guard." };
+    }
   }
 
   const dryRun = validateDryRunBeforeApply(displayPath);
@@ -1604,6 +1957,15 @@ export async function applyPendingEdit(id: string): Promise<string> {
     if (!patchGuard.allowed) {
       pendingEdits.delete(id);
       throw new Error(patchGuard.reason ?? "Edit blocked by patch script guard.");
+    }
+    const decompGuard = await validateDecompEditGate({
+      relativePath: pending.relativePath,
+      newContent: pending.newContent,
+      oldContent: pending.oldContent,
+    });
+    if (!decompGuard.allowed) {
+      pendingEdits.delete(id);
+      throw new Error(decompGuard.reason ?? "Edit blocked by decomp guard.");
     }
   }
 

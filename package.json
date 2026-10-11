@@ -2,7 +2,7 @@
   "name": "blossom-assistant",
   "displayName": "Blossom Assistant",
   "description": "Local coding assistant for VS Code via Blossom ChatRouter (or Ollama).",
-  "version": "0.1.55",
+  "version": "0.1.57",
   "publisher": "blossom",
   "icon": "media/icon.png",
   "engines": {
@@ -329,6 +329,46 @@
           "default": 3,
           "description": "When blossom.agent.stepMode is confirmTools, pause for Continue/Stop after this many tool rounds."
         },
+        "blossom.agent.localRetryBeforeEscalate": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the tool-round cap is hit, run one local self-critique / bonus-tool pass before injecting ESCALATE_GEMINI."
+        },
+        "blossom.agent.parallelTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run independent read-only tools (search/read/diagnostics/symbols/…) in parallel within an agent round."
+        },
+        "blossom.memory.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Search/inject durable ChatRouter coding_lessons and expose search_coding_memory."
+        },
+        "blossom.memory.autoLearn": {
+          "type": "boolean",
+          "default": true,
+          "description": "After a successful local turn, soft-fail POST /v1/memory/coding with the answer as a lesson."
+        },
+        "blossom.decomp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the workspace looks like a matching decomp (nlpp-decomp: AGENT_HANDOFF + ctrdecomp), inject [NLPP DECOMP] policy, compress giant docs, and enforce append-only TOML / no-edit-during-relink."
+        },
+        "blossom.decomp.attachMaxChars": {
+          "type": "number",
+          "default": 3500,
+          "description": "Max characters per attached file in a decomp workspace (technical.md / AGENT_HANDOFF are compressed harder)."
+        },
+        "blossom.decomp.totalAttachBudget": {
+          "type": "number",
+          "default": 14000,
+          "description": "Soft total budget for FILE attaches in a decomp turn — keeps local 16k-ctx coders from overflowing."
+        },
+        "blossom.decomp.blockDuringRelink": {
+          "type": "boolean",
+          "default": true,
+          "description": "Block Apply/auto-apply while a ctrdecomp relink process is running."
+        },
         "blossom.siblingPeek.enabled": {
           "type": "boolean",
           "default": true,
@@ -441,6 +481,11 @@
           "maximum": 8,
           "description": "Max images to caption per turn."
         },
+        "blossom.vision.caption.unloadCoderFirst": {
+          "type": "boolean",
+          "default": true,
+          "description": "Before local VL caption, unload Ollama models (keep_alive=0) to free VRAM. Soft-fails if Ollama is unreachable."
+        },
         "blossom.deescalate.enabled": {
           "type": "boolean",
           "default": true,
@@ -509,7 +554,7 @@
         "blossom.web.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Public-internet research tools (web_search, fetch_url, browser_*). On by default so Blossom can search/fetch on its own when needed. Turn off to stay fully offline. Distinct from cloud LLM escalate (Gemini/Claude)."
+          "description": "Public-internet research: agent tools (web_search, fetch_url, browser_*) and ChatRouter /v1/research prefetch for docs/version/API asks. On by default. Turn off to stay fully offline. Distinct from cloud LLM escalate (Gemini/Claude)."
         },
         "blossom.web.askBeforeUse": {
           "type": "boolean",

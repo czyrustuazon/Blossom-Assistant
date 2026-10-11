@@ -7,24 +7,35 @@ import { promisify } from "util";
 const execFileAsync = promisify(execFile);
 
 /**
- * Optional dark-UI preprocess (invert + autocontrast) via Python/Pillow.
- * Soft-fails to the original path when Pillow is missing.
+ * Dark-UI preprocess for IDE toasts (R2): invert, autocontrast, 2× upscale,
+ * optional bottom-right crop heuristic, then threshold. Soft-fails to original.
  */
 async function tryPreprocessForOcr(filePath: string): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "blossom-ocr-"));
   const outPath = path.join(dir, `prep${path.extname(filePath) || ".png"}`);
-  const script = [
-    "from PIL import Image, ImageOps",
-    "import sys",
-    "src, dst = sys.argv[1], sys.argv[2]",
-    "img = Image.open(src).convert('L')",
-    "img = ImageOps.invert(img)",
-    "img = ImageOps.autocontrast(img)",
-    "img.save(dst)",
-  ].join("; ");
+  const script = `
+from PIL import Image, ImageOps, ImageEnhance
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+img = Image.open(src).convert("RGB")
+w, h = img.size
+# Prefer bottom-right toast region when the frame looks like a full IDE shot
+if w >= 640 and h >= 400:
+    left = int(w * 0.45)
+    top = int(h * 0.55)
+    img = img.crop((left, top, w, h))
+img = img.convert("L")
+img = ImageOps.invert(img)
+img = ImageOps.autocontrast(img, cutoff=2)
+img = img.resize((img.width * 2, img.height * 2), Image.Resampling.LANCZOS)
+img = ImageEnhance.Contrast(img).enhance(1.4)
+# Soft threshold — keep gray anti-aliased text readable
+img = img.point(lambda p: 255 if p > 140 else (0 if p < 90 else p))
+img.save(dst)
+`.trim();
   try {
     await execFileAsync("python", ["-c", script, filePath, outPath], {
-      timeout: 15_000,
+      timeout: 20_000,
       windowsHide: true,
     });
     await fs.access(outPath);
@@ -32,7 +43,7 @@ async function tryPreprocessForOcr(filePath: string): Promise<string> {
   } catch {
     try {
       await execFileAsync("python3", ["-c", script, filePath, outPath], {
-        timeout: 15_000,
+        timeout: 20_000,
         windowsHide: true,
       });
       await fs.access(outPath);
@@ -53,9 +64,19 @@ export async function runLocalOcr(
   const command = (opts.command || "tesseract").trim() || "tesseract";
   const prepared = await tryPreprocessForOcr(filePath);
   try {
+    // PSM 6 = assume a uniform block of text (toasts/dialogs).
     const { stdout, stderr } = await execFileAsync(
       command,
-      [prepared, "stdout", "-l", "eng", "--psm", "6"],
+      [
+        prepared,
+        "stdout",
+        "-l",
+        "eng",
+        "--psm",
+        "6",
+        "-c",
+        "preserve_interword_spaces=1",
+      ],
       {
         timeout: 30_000,
         windowsHide: true,

@@ -1,8 +1,11 @@
 import * as fs from "fs/promises";
+import * as path from "path";
+import * as vscode from "vscode";
 import { getConfig } from "../config";
 import type { ImageAttachment } from "../chat/attachments";
 import { formatImageMetadataBlock } from "../chat/attachments";
 import { runLocalOcr } from "./ocr";
+import { notifyChatRouterVisionPause, unloadOllamaModels } from "./unload";
 
 export type CaptionSource = "vl" | "ocr" | "metadata";
 
@@ -228,19 +231,48 @@ export async function captionImageAttachments(
     `Local vision caption (${slice.length} image${slice.length === 1 ? "" : "s"}) via Ollama…`
   );
 
+  const fullCfg = getConfig();
+  if (cfg.unloadCoderFirst !== false) {
+    opts?.onStatus?.("Freeing VRAM for local VL (unload Ollama models)…");
+    await notifyChatRouterVisionPause(fullCfg.baseUrl);
+    const prefer = [
+      fullCfg.models.coding,
+      cfg.model,
+    ].filter(Boolean);
+    const { unloaded, errors } = await unloadOllamaModels({
+      baseUrl: cfg.ollamaBaseUrl,
+      preferUnload: prefer,
+    });
+    if (unloaded.length) {
+      opts?.onStatus?.(
+        `Unloaded ${unloaded.length} Ollama model(s) before VL caption.`
+      );
+    } else if (errors.length) {
+      opts?.onStatus?.(
+        `VRAM unload soft-failed (${errors[0]}) — continuing caption.`
+      );
+    }
+  }
+
   const captions: ImageCaption[] = [];
-  for (const att of slice) {
-    opts?.onStatus?.(`Captioning ${att.fileName}…`);
-    captions.push(
-      await captionOne(att, {
-        model: cfg.model,
-        baseUrl: cfg.ollamaBaseUrl,
-        timeoutMs: cfg.timeoutMs,
-        ocrFallback: cfg.ocrFallback,
-        ocrCommand: cfg.ocrCommand,
-        signal: opts?.signal,
-      })
+  // Parallel captions when multiple images (R3 mitigation).
+  const captionOpts = {
+    model: cfg.model,
+    baseUrl: cfg.ollamaBaseUrl,
+    timeoutMs: cfg.timeoutMs,
+    ocrFallback: cfg.ocrFallback,
+    ocrCommand: cfg.ocrCommand,
+    signal: opts?.signal,
+  };
+  if (slice.length === 1) {
+    opts?.onStatus?.(`Captioning ${slice[0].fileName}…`);
+    captions.push(await captionOne(slice[0], captionOpts));
+  } else {
+    opts?.onStatus?.(`Captioning ${slice.length} images in parallel…`);
+    const results = await Promise.all(
+      slice.map((att) => captionOne(att, captionOpts))
     );
+    captions.push(...results);
   }
 
   const usable = captions.some((c) => c.source === "vl" || c.source === "ocr");
@@ -257,7 +289,58 @@ export async function captionImageAttachments(
       .filter(Boolean)
       .join("\n");
   }
+
+  await persistLastCaptions(captions, block).catch(() => {
+    // best-effort R5
+  });
+
   return { captions, block, usable };
+}
+
+/** Persist last caption block under .blossom/ for history re-asks (R5). */
+async function persistLastCaptions(
+  captions: ImageCaption[],
+  block: string
+): Promise<void> {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder || !block.trim()) {
+    return;
+  }
+  const dir = path.join(folder.uri.fsPath, ".blossom");
+  await fs.mkdir(dir, { recursive: true });
+  const payload = {
+    savedAt: new Date().toISOString(),
+    captions: captions.map((c) => ({
+      fileName: c.fileName,
+      source: c.source,
+      text: c.text,
+      error: c.error,
+    })),
+    block,
+  };
+  await fs.writeFile(
+    path.join(dir, "last-captions.json"),
+    JSON.stringify(payload, null, 2),
+    "utf8"
+  );
+}
+
+/** Load last persisted caption block (empty if none). */
+export async function loadLastCaptionBlock(): Promise<string> {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder) {
+    return "";
+  }
+  try {
+    const raw = await fs.readFile(
+      path.join(folder.uri.fsPath, ".blossom", "last-captions.json"),
+      "utf8"
+    );
+    const data = JSON.parse(raw) as { block?: string };
+    return (data.block || "").trim();
+  } catch {
+    return "";
+  }
 }
 
 /** Clear in-memory caption cache (file mtime/size keyed). */

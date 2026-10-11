@@ -9,6 +9,56 @@ export interface LearnCodingLessonResult {
   error?: string;
 }
 
+export interface CodingMemoryHit {
+  id?: string;
+  text: string;
+}
+
+/** Format ChatRouter coding_lessons hits for prompt injection. */
+export function formatCodingMemoryBlock(
+  memories: CodingMemoryHit[],
+  opts?: { maxChars?: number }
+): string {
+  if (!memories.length) {
+    return "";
+  }
+  const maxChars = opts?.maxChars ?? 2500;
+  const parts = ["[CODING MEMORY — durable lessons; prefer disk/tools if conflicting]"];
+  let used = parts[0].length;
+  for (let i = 0; i < memories.length; i++) {
+    const text = (memories[i].text || "").trim().replace(/\s+/g, " ");
+    if (!text) {
+      continue;
+    }
+    const line = `${i + 1}. ${text.slice(0, 600)}`;
+    if (used + line.length + 1 > maxChars) {
+      break;
+    }
+    parts.push(line);
+    used += line.length + 1;
+  }
+  return parts.length > 1 ? parts.join("\n") : "";
+}
+
+/** Soft-fail search for injection into the coding turn. */
+export async function fetchCodingMemoryForPrompt(
+  query: string,
+  n = 4
+): Promise<{ block: string; count: number }> {
+  const cfg = getConfig();
+  if (cfg.memory?.enabled === false) {
+    return { block: "", count: 0 };
+  }
+  const result = await searchCodingLessons(query, n);
+  if (!result.ok || !result.memories.length) {
+    return { block: "", count: 0 };
+  }
+  return {
+    block: formatCodingMemoryBlock(result.memories),
+    count: result.memories.length,
+  };
+}
+
 /**
  * Persist a coding takeaway into ChatRouter's coding_lessons (Chroma).
  * No-op soft-fail if ChatRouter is down — escalate should still succeed.

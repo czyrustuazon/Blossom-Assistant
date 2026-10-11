@@ -675,6 +675,20 @@ class BlossomChatSession {
           decision: result.decision,
           detail: result.detail,
         }),
+      onPendingAskUser: (req) =>
+        this.post({
+          type: "pendingAskUser",
+          id: req.id,
+          question: req.question,
+          options: req.options,
+        }),
+      onAskUserResolved: (id, result) =>
+        this.post({
+          type: "askUserResolved",
+          id,
+          detail: result.detail,
+          skipped: !!result.skipped,
+        }),
       onPendingEdit: (edit, meta) => {
         const isDelete = edit.kind === "delete";
         const isNew = !isDelete && !edit.oldContent;
@@ -826,6 +840,9 @@ class BlossomChatSession {
     editId?: string;
     commandId?: string;
     stepId?: string;
+    askId?: string;
+    optionIndex?: number;
+    skipped?: boolean;
     decision?: string;
     command?: string;
     enabled?: boolean;
@@ -1067,6 +1084,26 @@ class BlossomChatSession {
         }
         break;
       }
+      case "resolveAskUser": {
+        const id = (msg.askId ?? "").trim();
+        if (!id) {
+          break;
+        }
+        if (msg.skipped === true || msg.decision === "skip") {
+          this.orchestrator.resolveAskUser(id, { kind: "skip" });
+          break;
+        }
+        const index = Number(msg.optionIndex);
+        if (Number.isFinite(index) && index >= 0) {
+          this.orchestrator.resolveAskUser(id, {
+            kind: "choice",
+            index: Math.floor(index),
+          });
+        } else {
+          this.orchestrator.resolveAskUser(id, { kind: "skip" });
+        }
+        break;
+      }
       case "setMode":
         break;
       case "setFastMode": {
@@ -1111,6 +1148,24 @@ class BlossomChatSession {
           error: result.error,
           detail: result.detail,
         });
+        if (result.ok && verdict === "correct") {
+          // Reinforce durable coding memory on thumbs-up (soft-fail).
+          const { learnCodingLesson } = await import("../memory/client");
+          const snap = this.orchestrator.getArchiveSnapshot();
+          const lastUser = [...snap.history]
+            .reverse()
+            .find((m) => m.role === "user");
+          const lastAsst = [...snap.history]
+            .reverse()
+            .find((m) => m.role === "assistant");
+          if (lastUser?.content && lastAsst?.content) {
+            void learnCodingLesson({
+              userPrompt: lastUser.content,
+              answer: lastAsst.content,
+              source: "blossom_assistant_thumbs_up",
+            });
+          }
+        }
         if (
           result.ok &&
           verdict === "incorrect" &&
@@ -1162,10 +1217,22 @@ class BlossomChatSession {
       --accent: var(--vscode-button-background);
       --accent-fg: var(--vscode-button-foreground);
       --card: var(--vscode-editorWidget-background, var(--vscode-editor-background));
-      --user: color-mix(in srgb, var(--accent) 22%, transparent);
-      --assistant: color-mix(in srgb, var(--fg) 8%, transparent);
+      --surface-1: color-mix(in srgb, var(--fg) 4%, var(--bg));
+      --surface-2: color-mix(in srgb, var(--fg) 7%, var(--card));
+      --user: color-mix(in srgb, var(--accent) 18%, transparent);
+      --assistant: color-mix(in srgb, var(--fg) 6%, transparent);
       --danger: var(--vscode-errorForeground);
       --ok: var(--vscode-testing-iconPassed, #3fae5a);
+      --radius: 8px;
+      --radius-sm: 6px;
+      --prose-lh: 1.55;
+      --diff-add-fg: var(--vscode-gitDecoration-addedResourceForeground, var(--vscode-testing-iconPassed, #3fae5a));
+      --diff-del-fg: var(--vscode-gitDecoration-deletedResourceForeground, var(--vscode-errorForeground));
+      --diff-add-bg: var(--vscode-diffEditor-insertedTextBackground, color-mix(in srgb, var(--diff-add-fg) 18%, transparent));
+      --diff-del-bg: var(--vscode-diffEditor-removedTextBackground, color-mix(in srgb, var(--diff-del-fg) 16%, transparent));
+      --diff-add-ih: var(--vscode-diffEditor-insertedLineBackground, color-mix(in srgb, var(--diff-add-fg) 40%, transparent));
+      --diff-del-ih: var(--vscode-diffEditor-removedLineBackground, color-mix(in srgb, var(--diff-del-fg) 40%, transparent));
+      --focus: var(--vscode-focusBorder, var(--accent));
     }
     * { box-sizing: border-box; }
     html, body {
@@ -1179,38 +1246,81 @@ class BlossomChatSession {
     body {
       display: flex;
       flex-direction: column;
-      padding: 12px;
+      padding: 10px 12px 12px;
       gap: 8px;
     }
-    header {
+    header.chrome {
       display: flex;
       flex-direction: column;
       gap: 6px;
+      flex-shrink: 0;
     }
     .brand-row {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
+      min-width: 0;
     }
     .brand-row img {
-      width: 28px;
-      height: 28px;
-      border-radius: 6px;
+      width: 22px;
+      height: 22px;
+      border-radius: 5px;
+      flex-shrink: 0;
     }
-    .brand-spacer { flex: 1; }
+    .brand {
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .brand-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      flex: 1;
+      color: var(--muted);
+      font-size: 0.8em;
+      line-height: 1.35;
+    }
+    .brand-status #healthText {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .mode-line {
+      color: var(--muted);
+      font-size: 0.78em;
+      line-height: 1.3;
+      opacity: 0.85;
+    }
+    .mode-line:empty { display: none; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      align-items: center;
+    }
+    .toolbar .btn-stop {
+      margin-left: auto;
+    }
     .busy-row {
       display: none;
       align-items: center;
       gap: 8px;
       min-height: 18px;
-      margin-top: 8px;
-      padding: 4px 2px;
+      margin-top: 4px;
+      padding: 6px 8px;
       color: var(--muted);
       font-size: 0.85em;
       flex-shrink: 0;
       flex-wrap: nowrap;
       border: none;
-      background: transparent;
+      border-radius: var(--radius-sm);
+      background: var(--surface-1);
     }
     .busy-row.on {
       display: flex;
@@ -1240,12 +1350,8 @@ class BlossomChatSession {
       font-style: italic;
       color: var(--muted);
       opacity: 0.9;
-      line-height: 1.35;
+      line-height: 1.4;
       font-size: 0.92em;
-    }
-    @keyframes blossom-reason-fade {
-      from { opacity: 0.2; }
-      to { opacity: 0.85; }
     }
     .spinner {
       width: 14px;
@@ -1259,10 +1365,9 @@ class BlossomChatSession {
     @keyframes blossom-spin {
       to { transform: rotate(360deg); }
     }
-    .brand {
-      font-size: 1.15rem;
-      font-weight: 650;
-      letter-spacing: 0.02em;
+    @media (prefers-reduced-motion: reduce) {
+      .spinner { animation: none; border-top-color: color-mix(in srgb, var(--fg) 45%, transparent); opacity: 0.85; }
+      * { scroll-behavior: auto !important; }
     }
     .meta {
       color: var(--muted);
@@ -1276,31 +1381,57 @@ class BlossomChatSession {
       align-items: center;
     }
     button, .chip {
-      border: 1px solid var(--border);
-      background: var(--card);
+      border: 1px solid transparent;
+      background: var(--surface-1);
       color: var(--fg);
-      border-radius: 6px;
-      padding: 4px 10px;
+      border-radius: var(--radius-sm);
+      padding: 4px 9px;
       cursor: pointer;
       font: inherit;
+      transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+    }
+    button:hover:not(:disabled), .chip:hover:not(:disabled) {
+      background: var(--surface-2);
+      border-color: color-mix(in srgb, var(--border) 70%, transparent);
+    }
+    button:focus-visible, .chip:focus-visible {
+      outline: 1px solid var(--focus);
+      outline-offset: 1px;
+    }
+    button:active:not(:disabled), .chip:active:not(:disabled) {
+      opacity: 0.92;
     }
     button.primary {
       background: var(--accent);
       color: var(--accent-fg);
       border-color: transparent;
     }
+    button.primary:hover:not(:disabled) {
+      filter: brightness(1.08);
+      background: var(--accent);
+      border-color: transparent;
+    }
     button:disabled { opacity: 0.5; cursor: default; }
+    .chip {
+      border-color: color-mix(in srgb, var(--border) 55%, transparent);
+      background: var(--card);
+    }
     .chip.active {
-      outline: 1px solid var(--accent);
-      background: color-mix(in srgb, var(--accent) 25%, transparent);
+      border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+      background: color-mix(in srgb, var(--accent) 22%, transparent);
+    }
+    .toolbar button, .toolbar .chip {
+      font-size: 0.82em;
+      padding: 3px 8px;
     }
     #messages {
       flex: 1;
       overflow: auto;
       display: flex;
       flex-direction: column;
-      gap: 12px;
-      padding: 4px 2px 12px;
+      gap: 14px;
+      padding: 2px 0 10px;
+      min-height: 0;
     }
     /* Do not flex-shrink cards — that crushed diff views into a 1-line strip. */
     #messages > * {
@@ -1308,31 +1439,31 @@ class BlossomChatSession {
     }
     .msg {
       padding: 10px 12px;
-      border-radius: 8px;
+      border-radius: var(--radius);
       white-space: pre-wrap;
       word-break: break-word;
-      line-height: 1.45;
-      border: 1px solid var(--border);
+      line-height: var(--prose-lh);
+      border: none;
     }
     .msg.user { background: var(--user); }
     .msg.assistant { background: var(--assistant); }
     .tool {
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 0.85em;
-      line-height: 1.45;
+      line-height: 1.5;
       color: var(--muted);
       white-space: pre-wrap;
       word-break: break-word;
-      padding: 6px 8px;
-      border-radius: 6px;
-      border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
-      background: color-mix(in srgb, var(--fg) 4%, transparent);
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      border: none;
+      background: var(--surface-1);
       max-height: 220px;
       overflow: auto;
     }
     .tool .tool-hd {
       color: color-mix(in srgb, var(--fg) 78%, var(--muted));
-      font-weight: 650;
+      font-weight: 600;
       margin-bottom: 2px;
     }
     .tool .tool-bd {
@@ -1351,6 +1482,7 @@ class BlossomChatSession {
     .feedback-row {
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
       gap: 6px;
       margin-top: 2px;
       padding: 2px 0;
@@ -1362,16 +1494,15 @@ class BlossomChatSession {
     }
     .feedback-row button {
       padding: 2px 8px;
-      font-size: 0.95em;
-      line-height: 1.2;
-      min-width: 2em;
+      font-size: 0.8em;
+      line-height: 1.3;
     }
     .feedback-row button.active-up {
-      outline: 1px solid var(--accent);
+      border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
       background: color-mix(in srgb, var(--accent) 22%, transparent);
     }
     .feedback-row button.active-down {
-      outline: 1px solid var(--danger);
+      border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
       background: color-mix(in srgb, var(--danger) 18%, transparent);
     }
     .feedback-row .fb-status {
@@ -1393,12 +1524,17 @@ class BlossomChatSession {
       color: var(--muted);
       font-size: 0.8em;
     }
-    .msg.system { color: var(--muted); border-style: dashed; font-size: 0.9em; }
+    .msg.system {
+      color: var(--muted);
+      background: transparent;
+      border: 1px dashed color-mix(in srgb, var(--border) 80%, transparent);
+      font-size: 0.9em;
+    }
     .msg.error { color: var(--danger); }
     .error-card {
       position: relative;
       border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
-      border-radius: 8px;
+      border-radius: var(--radius);
       background: color-mix(in srgb, var(--danger) 8%, var(--card));
       padding: 10px 12px;
       display: flex;
@@ -1412,7 +1548,7 @@ class BlossomChatSession {
       gap: 8px;
     }
     .error-card-title {
-      font-weight: 650;
+      font-weight: 600;
       color: var(--danger);
       font-size: 0.9em;
     }
@@ -1422,20 +1558,18 @@ class BlossomChatSession {
     }
     .error-card-question {
       font-size: 0.9em;
-      line-height: 1.4;
+      line-height: var(--prose-lh);
       white-space: pre-wrap;
       word-break: break-word;
       padding: 8px 10px;
-      border-radius: 6px;
-      background: color-mix(in srgb, var(--fg) 6%, var(--card));
-      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      background: var(--surface-1);
+      border: none;
       color: var(--fg);
     }
     .error-card-question-label {
-      font-size: 0.7rem;
-      font-weight: 700;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
+      font-size: 0.78em;
+      font-weight: 600;
       color: var(--muted);
       margin-bottom: 4px;
     }
@@ -1447,16 +1581,14 @@ class BlossomChatSession {
       word-break: break-word;
     }
     .reply-section, .code-box {
-      border: 1px solid var(--border);
-      border-radius: 4px;
+      border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      border-radius: var(--radius-sm);
       overflow: hidden;
       background: var(--card);
     }
     .reply-eyebrow {
-      font-size: 0.72rem;
-      font-weight: 700;
-      letter-spacing: 0.07em;
-      text-transform: uppercase;
+      font-size: 0.8em;
+      font-weight: 600;
       color: var(--muted);
       margin: 0;
     }
@@ -1470,15 +1602,15 @@ class BlossomChatSession {
       flex-direction: column;
       gap: 8px;
       padding-left: 10px;
-      border-left: 2px solid color-mix(in srgb, var(--fg) 16%, transparent);
+      border-left: 2px solid color-mix(in srgb, var(--fg) 14%, transparent);
     }
     .file-action {
       display: flex;
       align-items: center;
       gap: 10px;
       padding: 8px 12px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
+      border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      border-radius: var(--radius-sm);
       background: var(--card);
       font-size: 0.9em;
     }
@@ -1487,10 +1619,8 @@ class BlossomChatSession {
       background: color-mix(in srgb, var(--danger) 8%, var(--card));
     }
     .file-action-label {
-      font-size: 0.72rem;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
+      font-size: 0.8em;
+      font-weight: 600;
       color: var(--danger);
       flex-shrink: 0;
     }
@@ -1498,22 +1628,21 @@ class BlossomChatSession {
       font-family: var(--vscode-editor-font-family, monospace);
       font-weight: 600;
     }
-    .reply-section-hd, .code-box-hd {
-      font-size: 0.72rem;
-      font-weight: 700;
-      letter-spacing: 0.07em;
-      text-transform: uppercase;
+    .reply-section-hd {
+      font-size: 0.8em;
+      font-weight: 600;
       padding: 6px 10px;
-      border-bottom: 1px solid var(--border);
-      background: color-mix(in srgb, var(--fg) 7%, var(--card));
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      background: var(--surface-2);
       color: var(--muted);
     }
     .code-box-hd {
       display: flex;
       align-items: baseline;
       gap: 8px;
-      text-transform: none;
-      letter-spacing: 0.01em;
+      padding: 6px 10px;
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      background: var(--surface-2);
       font-size: 0.82rem;
       font-weight: 600;
       font-family: var(--vscode-editor-font-family, monospace);
@@ -1523,16 +1652,17 @@ class BlossomChatSession {
       margin-left: auto;
       font-size: 0.72rem;
       font-weight: 600;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
+      letter-spacing: 0.02em;
       color: var(--muted);
       font-family: var(--vscode-font-family);
+      text-transform: uppercase;
     }
     .reply-section-bd {
       padding: 8px 12px 10px;
+      line-height: var(--prose-lh);
     }
     .reply-section-bd p {
-      margin: 0 0 6px;
+      margin: 0 0 8px;
     }
     .reply-section-bd p:last-child {
       margin-bottom: 0;
@@ -1544,7 +1674,7 @@ class BlossomChatSession {
     }
     .reply-section-bd li {
       margin: 5px 0;
-      line-height: 1.4;
+      line-height: var(--prose-lh);
     }
     .reply-section-bd li.check {
       list-style: none;
@@ -1556,11 +1686,14 @@ class BlossomChatSession {
       content: "";
       position: absolute;
       left: 0.15em;
-      top: 0.45em;
+      top: 0.5em;
       width: 0.55em;
       height: 0.55em;
       border-radius: 2px;
       background: var(--ok);
+    }
+    .reply-prose {
+      line-height: var(--prose-lh);
     }
     .reply-prose p {
       margin: 0 0 8px;
@@ -1576,26 +1709,20 @@ class BlossomChatSession {
       white-space: pre;
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 0.85em;
-      line-height: 1.45;
+      line-height: 1.5;
       background: color-mix(in srgb, var(--bg) 70%, var(--card));
     }
     .inline-code {
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 0.9em;
-      padding: 0 4px;
-      border-radius: 3px;
+      padding: 0.1em 0.35em;
+      border-radius: 4px;
       background: color-mix(in srgb, var(--fg) 10%, transparent);
-    }
-    .inline-code {
-      font-size: 0.85em;
-      background: var(--card);
-      border: 1px dashed var(--border);
-      border-radius: 8px;
-      padding: 8px;
+      border: none;
     }
     .edit {
-      border-style: solid;
-      border-color: var(--border);
+      border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+      border-radius: var(--radius);
       padding: 0;
       overflow: hidden;
       background: color-mix(in srgb, var(--bg) 55%, var(--card));
@@ -1605,19 +1732,16 @@ class BlossomChatSession {
       align-items: center;
       gap: 8px;
       padding: 10px 12px;
-      border-bottom: 1px solid var(--border);
-      background: color-mix(in srgb, var(--fg) 5%, var(--card));
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      background: var(--surface-2);
     }
     .diff-file-icon {
-      width: 14px;
-      height: 14px;
-      border-radius: 3px;
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
       flex-shrink: 0;
-      background:
-        linear-gradient(135deg,
-          color-mix(in srgb, var(--accent) 70%, #fff) 0%,
-          var(--accent) 100%);
-      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 18%, transparent);
+      background: var(--accent);
+      opacity: 0.85;
     }
     .diff-file-name {
       flex: 1;
@@ -1633,39 +1757,34 @@ class BlossomChatSession {
     .diff-file-stats {
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 0.8em;
-      font-weight: 650;
+      font-weight: 600;
       flex-shrink: 0;
-      letter-spacing: 0.02em;
     }
-    .diff-file-stats .add { color: #3fb950; }
-    .diff-file-stats .del { color: #f85149; margin-left: 6px; }
+    .diff-file-stats .add { color: var(--diff-add-fg); }
+    .diff-file-stats .del { color: var(--diff-del-fg); margin-left: 6px; }
     .diff-file-badge {
-      font-size: 0.72em;
-      font-weight: 650;
-      letter-spacing: 0.03em;
-      text-transform: uppercase;
+      font-size: 0.75em;
+      font-weight: 600;
       color: color-mix(in srgb, var(--accent) 85%, var(--fg));
-      border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
       border-radius: 4px;
       padding: 1px 6px;
       flex-shrink: 0;
     }
     .diff-replace {
-      border-bottom: 1px solid var(--border);
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 0.88em;
       line-height: 1.55;
     }
     .diff-replace-hd {
       padding: 8px 12px 4px;
-      font-size: 0.78em;
-      font-weight: 650;
-      letter-spacing: 0.02em;
+      font-size: 0.8em;
+      font-weight: 600;
       color: var(--muted);
-      text-transform: uppercase;
     }
-    .diff-replace-hd.del { color: #f85149; }
-    .diff-replace-hd.add { color: #3fb950; }
+    .diff-replace-hd.del { color: var(--diff-del-fg); }
+    .diff-replace-hd.add { color: var(--diff-add-fg); }
     .diff-view {
       max-height: min(560px, 55vh);
       overflow: auto;
@@ -1710,19 +1829,17 @@ class BlossomChatSession {
       padding-right: 12px;
       min-width: 0;
     }
-    .diff-line.add { background: rgba(46, 160, 67, 0.18); }
-    .diff-line.del { background: rgba(248, 81, 73, 0.16); }
+    .diff-line.add { background: var(--diff-add-bg); }
+    .diff-line.del { background: var(--diff-del-bg); }
     .diff-line.ctx { color: color-mix(in srgb, var(--fg) 72%, transparent); }
-    .diff-line.add .gutter { color: #3fb950; }
-    .diff-line.del .gutter { color: #f85149; }
+    .diff-line.add .gutter { color: var(--diff-add-fg); }
+    .diff-line.del .gutter { color: var(--diff-del-fg); }
     .diff-line .ih { border-radius: 2px; }
     .diff-line.del .ih {
-      background: rgba(248, 81, 73, 0.45);
-      color: color-mix(in srgb, #ffd7d5 40%, var(--fg));
+      background: var(--diff-del-ih);
     }
     .diff-line.add .ih {
-      background: rgba(46, 160, 67, 0.45);
-      color: color-mix(in srgb, #d4f4d7 35%, var(--fg));
+      background: var(--diff-add-ih);
     }
     .diff-empty {
       padding: 10px 12px;
@@ -1732,9 +1849,10 @@ class BlossomChatSession {
     .edit .row { padding: 10px 12px 12px; }
     .edit .cmd-card-status { padding: 8px 12px 12px; }
     .cmd-card {
-      border-style: solid;
-      border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+      border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+      border-radius: var(--radius);
       background: color-mix(in srgb, var(--accent) 8%, var(--card));
+      padding: 10px 12px;
     }
     .cmd-card.resolved {
       border-style: dashed;
@@ -1743,10 +1861,10 @@ class BlossomChatSession {
       opacity: 0.92;
     }
     .cmd-card.denied {
-      border-color: color-mix(in srgb, #c44 45%, var(--border));
+      border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
     }
     .cmd-card-title {
-      font-weight: 650;
+      font-weight: 600;
       margin-bottom: 6px;
       color: var(--fg);
     }
@@ -1756,7 +1874,7 @@ class BlossomChatSession {
       white-space: pre-wrap;
       word-break: break-word;
       padding: 6px 8px;
-      border-radius: 6px;
+      border-radius: var(--radius-sm);
       background: color-mix(in srgb, var(--fg) 6%, transparent);
       margin: 0 0 6px;
     }
@@ -1769,15 +1887,32 @@ class BlossomChatSession {
       color: var(--muted);
       margin-top: 6px;
     }
+    .ask-card-question {
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0 0 10px;
+      line-height: 1.45;
+    }
+    .ask-card-options {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .ask-card-options button {
+      text-align: left;
+      white-space: normal;
+      line-height: 1.35;
+    }
     .summary-card {
-      border-style: solid;
-      border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-      background: color-mix(in srgb, var(--accent) 10%, var(--card));
+      border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+      border-radius: var(--radius);
+      background: color-mix(in srgb, var(--accent) 8%, var(--card));
       margin-top: 4px;
       padding: 10px 12px;
     }
     .summary-card .title {
-      font-weight: 650;
+      font-weight: 600;
       margin-bottom: 8px;
     }
     .summary-card ul {
@@ -1786,7 +1921,7 @@ class BlossomChatSession {
     }
     .summary-card li {
       margin: 4px 0;
-      line-height: 1.45;
+      line-height: var(--prose-lh);
     }
     .edit pre {
       max-height: 280px;
@@ -1801,8 +1936,9 @@ class BlossomChatSession {
       display: flex;
       flex-direction: column;
       gap: 6px;
-      border-top: 1px solid var(--border);
-      padding-top: 8px;
+      border-top: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+      padding-top: 10px;
+      flex-shrink: 0;
     }
     .attach-row {
       display: flex;
@@ -1814,12 +1950,12 @@ class BlossomChatSession {
     .attach-chip {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
+      gap: 6px;
       font-size: 0.82em;
-      padding: 2px 8px;
-      border-radius: 999px;
-      background: var(--chip-bg, rgba(127,127,127,0.15));
-      border: 1px solid var(--border);
+      padding: 3px 8px;
+      border-radius: var(--radius-sm);
+      background: var(--surface-1);
+      border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
       max-width: 100%;
     }
     .attach-chip button {
@@ -1831,9 +1967,10 @@ class BlossomChatSession {
       line-height: 1;
       opacity: 0.7;
     }
-    .attach-chip button:hover { opacity: 1; }
+    .attach-chip button:hover { opacity: 1; background: transparent; }
     .msg.user.context-inject {
-      border-left: 3px solid var(--vscode-textLink-foreground, #3794ff);
+      border-left: 3px solid var(--vscode-textLink-foreground, var(--accent));
+      border-radius: 0 var(--radius) var(--radius) 0;
       opacity: 0.95;
     }
     .context-inject-label {
@@ -1841,8 +1978,6 @@ class BlossomChatSession {
       font-weight: 600;
       opacity: 0.75;
       margin-bottom: 4px;
-      text-transform: uppercase;
-      letter-spacing: 0.03em;
     }
     .context-inject-body {
       white-space: pre-wrap;
@@ -1853,23 +1988,25 @@ class BlossomChatSession {
       gap: 0;
       background: var(--input-bg);
       color: var(--input-fg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
+      border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+      border-radius: var(--radius);
       overflow: hidden;
     }
     .composer-box:focus-within {
-      outline: 1px solid var(--vscode-focusBorder, var(--accent));
+      outline: 1px solid var(--focus);
+      border-color: var(--focus);
     }
     textarea {
       width: 100%;
-      min-height: 88px;
+      min-height: 72px;
       resize: vertical;
       background: transparent;
       color: inherit;
       border: none;
       border-radius: 0;
-      padding: 8px 8px 4px;
+      padding: 10px 10px 6px;
       font: inherit;
+      line-height: var(--prose-lh);
       outline: none;
     }
     .composer-actions {
@@ -1877,45 +2014,47 @@ class BlossomChatSession {
       flex-wrap: wrap;
       gap: 6px;
       align-items: center;
-      padding: 4px 6px 6px;
-      border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      padding: 6px 8px 8px;
+      border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
     }
     .composer-actions .spacer {
       flex: 1;
       min-width: 4px;
     }
     .composer-actions button {
-      font-size: 0.9em;
-      padding: 3px 9px;
+      font-size: 0.88em;
+      padding: 4px 10px;
     }
     .dot {
-      width: 8px; height: 8px; border-radius: 50%;
-      display: inline-block; margin-right: 6px;
+      width: 7px; height: 7px; border-radius: 50%;
+      display: inline-block; flex-shrink: 0;
       background: var(--danger);
     }
     .dot.ok { background: var(--ok); }
   </style>
 </head>
 <body>
-  <header>
+  <header class="chrome">
     <div class="brand-row">
       <img src="${iconUri}" alt="" />
       <div class="brand">${escapeHtml(displayName)}</div>
-      <div class="brand-spacer"></div>
+      <div class="brand-status" id="health" title="Backend status">
+        <span class="dot" id="healthDot" aria-hidden="true"></span>
+        <span id="healthText">Checking backend…</span>
+      </div>
     </div>
-    <div class="meta" id="health"><span class="dot" id="healthDot"></span><span id="healthText">Checking backend…</span></div>
-    <div class="meta" id="modeLine">Coding assistant</div>
-    <div class="row">
-      <button class="chip" id="btnScratchpad" title="Workspace working notes injected into each coding turn">Scratchpad</button>
-      <button class="chip" id="btnHistory" title="Open a previously saved Blossom chat">History</button>
-      <button id="btnHealth" title="Recheck Blossom / Ollama">Ping</button>
-      <button id="btnClear" title="Clear conversation (current chat stays in History)">Clear</button>
-      <button id="btnCancel">Stop</button>
+    <div class="mode-line" id="modeLine">Coding assistant</div>
+    <div class="toolbar" role="toolbar" aria-label="Chat actions">
+      <button type="button" class="chip" id="btnScratchpad" title="Workspace working notes injected into each coding turn">Scratchpad</button>
+      <button type="button" class="chip" id="btnHistory" title="Open a previously saved Blossom chat">History</button>
+      <button type="button" id="btnHealth" title="Recheck Blossom / Ollama">Ping</button>
+      <button type="button" id="btnClear" title="Clear conversation (current chat stays in History)">Clear</button>
+      <button type="button" class="btn-stop" id="btnCancel" title="Stop the current turn">Stop</button>
     </div>
   </header>
-  <div id="messages">
+  <div id="messages" role="log" aria-relevant="additions">
     <div class="busy-row" id="busyRow" aria-hidden="true">
-      <div class="spinner" id="busySpinner" title="Working…"></div>
+      <div class="spinner" id="busySpinner" aria-hidden="true" title="Working…"></div>
       <span id="busyLabel">Working…</span>
       <div id="busyReasoningWrap" class="busy-reasoning-wrap" aria-live="polite">
         <span class="busy-reasoning-label">Blossom Thinking</span>
@@ -1926,12 +2065,12 @@ class BlossomChatSession {
   <div class="composer">
     <div class="attach-row" id="attachRow" hidden></div>
     <div class="composer-box">
-      <textarea id="input" placeholder="Ask your coding assistant…"></textarea>
+      <textarea id="input" placeholder="Ask your coding assistant…" aria-label="Message"></textarea>
       <div class="composer-actions">
-        <button class="chip" id="btnFastMode" title="Fast mode: auto-run shell commands and auto-apply edits. Click again to turn off.">Fast</button>
+        <button type="button" class="chip" id="btnFastMode" title="Fast mode: auto-run shell commands and auto-apply edits. Click again to turn off.">Fast</button>
         <div class="spacer"></div>
-        <button id="btnAttach" title="Attach PNG/JPEG/WebP/GIF (vision → Cursor escalate)">Attach image</button>
-        <button class="primary" id="btnSend">Send</button>
+        <button type="button" id="btnAttach" title="Attach PNG/JPEG/WebP/GIF for local vision captioning">Attach image</button>
+        <button type="button" class="primary" id="btnSend">Send</button>
       </div>
     </div>
   </div>
@@ -1964,10 +2103,11 @@ class BlossomChatSession {
         chip.className = 'attach-chip';
         chip.title = a.metadata || a.path || '';
         const label = document.createElement('span');
-        label.textContent = '🖼 ' + (a.fileName || 'image');
+        label.textContent = a.fileName || 'image';
         const rm = document.createElement('button');
         rm.type = 'button';
         rm.textContent = '×';
+        rm.setAttribute('aria-label', 'Remove ' + (a.fileName || 'image'));
         rm.title = 'Remove';
         rm.onclick = () => {
           pendingAttachments.splice(i, 1);
@@ -2227,6 +2367,50 @@ class BlossomChatSession {
       messagesEl.appendChild(el);
       pinBusyToBottom();
       return el;
+    }
+
+    /** Seal the open streaming bubble with rich markdown; next token opens a new one. */
+    function sealStreamingBubble() {
+      if (!streamingEl) return;
+      const body = streamingEl.textContent || '';
+      if (body.trim()) {
+        renderAssistant(streamingEl, body);
+      } else {
+        streamingEl.remove();
+      }
+      streamingEl = null;
+    }
+
+    /**
+     * Split a long live stream into separate bubbles at natural segment markers
+     * (closed scratchpad fences, Edit/Summary headings) so narration is not one wall.
+     */
+    function splitStreamingOnMarkers() {
+      if (!streamingEl) return;
+      let body = streamingEl.textContent || '';
+      let guard = 0;
+      while (guard++ < 12) {
+        let cut = -1;
+        const scratch = body.match(/\`\`\`scratchpad\\r?\\n[\\s\\S]*?\`\`\`/);
+        if (scratch && typeof scratch.index === 'number') {
+          cut = scratch.index + scratch[0].length;
+        } else {
+          const heading = body.match(/\\n\\n(?:#{1,3}\\s+|\\*\\*Edit:\\*\\*|\\*\\*Summary\\*\\*|###\\s+Summary\\b)/i);
+          if (heading && typeof heading.index === 'number' && heading.index >= 80) {
+            cut = heading.index;
+          }
+        }
+        if (cut < 0) break;
+        const head = body.slice(0, cut).replace(/\\s+$/, '');
+        const tail = body.slice(cut).replace(/^\\r?\\n+/, '');
+        if (!head.trim() || !tail.trim()) break;
+        const ticks = (head.match(/\`\`\`/g) || []).length;
+        if (ticks % 2 !== 0) break;
+        renderAssistant(streamingEl, head);
+        streamingEl = null;
+        streamingEl = append('assistant', tail);
+        body = tail;
+      }
     }
 
     function appendInline(parent, text) {
@@ -2529,13 +2713,13 @@ class BlossomChatSession {
       const up = document.createElement('button');
       up.type = 'button';
       up.title = 'Correct';
-      up.setAttribute('aria-label', 'Thumbs up');
-      up.textContent = '👍';
+      up.setAttribute('aria-label', 'Helpful');
+      up.textContent = 'Helpful';
       const down = document.createElement('button');
       down.type = 'button';
       down.title = 'Incorrect';
-      down.setAttribute('aria-label', 'Thumbs down');
-      down.textContent = '👎';
+      down.setAttribute('aria-label', 'Not helpful');
+      down.textContent = 'Not helpful';
       const status = document.createElement('span');
       status.className = 'fb-status';
       const lock = (verdict) => {
@@ -2599,6 +2783,7 @@ class BlossomChatSession {
 
     function setBusy(v) {
       busy = v;
+      document.body.setAttribute('aria-busy', v ? 'true' : 'false');
       const sendBtn = document.getElementById('btnSend');
       if (sendBtn) {
         sendBtn.disabled = false;
@@ -2684,7 +2869,7 @@ class BlossomChatSession {
       row.className = 'busy-row';
       row.id = 'busyRow';
       row.setAttribute('aria-hidden', 'true');
-      row.innerHTML = '<div class="spinner" id="busySpinner" title="Working…"></div><span id="busyLabel">Working…</span><div id="busyReasoningWrap" class="busy-reasoning-wrap" aria-live="polite"><span class="busy-reasoning-label">Blossom Thinking</span><span id="busyReasoning" class="busy-reasoning"></span></div>';
+      row.innerHTML = '<div class="spinner" id="busySpinner" aria-hidden="true" title="Working…"></div><span id="busyLabel">Working…</span><div id="busyReasoningWrap" class="busy-reasoning-wrap" aria-live="polite"><span class="busy-reasoning-label">Blossom Thinking</span><span id="busyReasoning" class="busy-reasoning"></span></div>';
       messagesEl.appendChild(row);
     }
 
@@ -2743,23 +2928,18 @@ class BlossomChatSession {
           // first token made the ticker invisible. Keep sentences rotating.
           if (!streamingEl) streamingEl = append('assistant', '');
           streamingEl.textContent += msg.text;
+          splitStreamingOnMarkers();
           pinBusyToBottom();
           break;
         case 'streamBreak':
           // Seal the current assistant bubble so Apply / ✓ cards sit between
           // segments; the next token opens a new bubble.
-          if (streamingEl) {
-            const body = streamingEl.textContent || '';
-            if (body.trim()) {
-              renderAssistant(streamingEl, body);
-            } else {
-              streamingEl.remove();
-            }
-            streamingEl = null;
-          }
+          sealStreamingBubble();
           pinBusyToBottom();
           break;
         case 'tool': {
+          // Keep tool rows outside the prose bubble (and restore markdown style).
+          sealStreamingBubble();
           const t = document.createElement('div');
           t.className = 'tool';
           const hd = document.createElement('div');
@@ -2786,6 +2966,7 @@ class BlossomChatSession {
           break;
         }
         case 'pendingCommand': {
+          sealStreamingBubble();
           const wrap = document.createElement('div');
           wrap.className = 'cmd-card';
           wrap.dataset.commandId = msg.id;
@@ -2834,6 +3015,7 @@ class BlossomChatSession {
           break;
         }
         case 'pendingStep': {
+          sealStreamingBubble();
           const wrap = document.createElement('div');
           wrap.className = 'cmd-card';
           wrap.dataset.stepId = msg.id;
@@ -2882,6 +3064,73 @@ class BlossomChatSession {
           }
           break;
         }
+        case 'pendingAskUser': {
+          sealStreamingBubble();
+          const wrap = document.createElement('div');
+          wrap.className = 'cmd-card';
+          wrap.dataset.askId = msg.id;
+          const title = document.createElement('div');
+          title.className = 'cmd-card-title';
+          title.textContent = 'Blossom needs a choice';
+          wrap.appendChild(title);
+          const q = document.createElement('div');
+          q.className = 'ask-card-question';
+          q.textContent = msg.question || 'Which option should I take?';
+          wrap.appendChild(q);
+          const optsWrap = document.createElement('div');
+          optsWrap.className = 'ask-card-options';
+          const letters = 'ABCDEF';
+          const options = Array.isArray(msg.options) ? msg.options : [];
+          const buttons = [];
+          const lockAsk = (payload) => {
+            buttons.forEach((b) => { b.disabled = true; });
+            vscode.postMessage(Object.assign({ type: 'resolveAskUser', askId: msg.id }, payload));
+          };
+          options.forEach((label, i) => {
+            const btn = document.createElement('button');
+            if (i === 0) btn.className = 'primary';
+            const letter = letters[i] || String(i + 1);
+            btn.textContent = letter + ' · ' + String(label || '');
+            btn.title = 'Choose option ' + letter;
+            btn.onclick = () => lockAsk({ optionIndex: i });
+            buttons.push(btn);
+            optsWrap.appendChild(btn);
+          });
+          wrap.appendChild(optsWrap);
+          const row = document.createElement('div');
+          row.className = 'row';
+          const skip = document.createElement('button');
+          skip.textContent = 'Skip';
+          skip.title = 'No preference — let Blossom continue without a choice';
+          skip.onclick = () => lockAsk({ skipped: true, decision: 'skip' });
+          buttons.push(skip);
+          row.appendChild(skip);
+          wrap.appendChild(row);
+          messagesEl.appendChild(wrap);
+          setBusyLabel('Waiting for your choice…');
+          pinBusyToBottom();
+          break;
+        }
+        case 'askUserResolved': {
+          const el = document.querySelector('[data-ask-id="' + msg.id + '"]');
+          if (el) {
+            el.classList.add('resolved');
+            if (msg.skipped) el.classList.add('denied');
+            el.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+            let st = el.querySelector('.cmd-card-status');
+            if (!st) {
+              st = document.createElement('div');
+              st.className = 'cmd-card-status';
+              el.appendChild(st);
+            }
+            st.textContent = msg.detail || (msg.skipped ? 'Skipped' : 'Answered');
+          }
+          if (!msg.skipped) {
+            setBusyLabel('Got your choice — continuing…');
+          }
+          pinBusyToBottom();
+          break;
+        }
         case 'commandResolved': {
           const el = document.querySelector('[data-command-id="' + msg.id + '"]');
           if (el) {
@@ -2903,6 +3152,7 @@ class BlossomChatSession {
           break;
         }
         case 'pendingEdit': {
+          sealStreamingBubble();
           const wrap = document.createElement('div');
           wrap.className = 'edit';
           wrap.dataset.editId = msg.id;
@@ -3197,27 +3447,17 @@ class BlossomChatSession {
         case 'assistantDone':
           // With live per-file streamBreaks, do NOT replace the last bubble with
           // the full turn text — each segment already holds its own slice.
-          if (streamingEl) {
-            const body = streamingEl.textContent || '';
-            if (body.trim()) {
-              renderAssistant(streamingEl, body);
-            } else {
-              streamingEl.remove();
-              streamingEl = null;
-            }
-          }
+          sealStreamingBubble();
           if (msg.feedbackId) {
-            const target = streamingEl || messagesEl.querySelector('.msg.assistant:last-of-type');
+            const target = messagesEl.querySelector('.msg.assistant:last-of-type');
             if (target) attachFeedback(target, msg.feedbackId);
           }
           if (msg.deescalateAvailable) {
             const deTarget = messagesEl.querySelector('.feedback-row:last-of-type')
-              || streamingEl
               || messagesEl.querySelector('.msg.assistant:last-of-type');
             if (deTarget) attachDeescalate(deTarget);
           }
           setBusy(false);
-          streamingEl = null;
           break;
         case 'feedbackResult': {
           const row = document.querySelector('.feedback-row[data-feedback-id="' + (msg.feedbackId || '') + '"]');
