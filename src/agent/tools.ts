@@ -21,6 +21,22 @@ import {
   loadChatArchive,
   searchChatArchives,
 } from "./chatArchive";
+import {
+  isWebEffectivelyEnabled,
+  isWebTool,
+  webDisabledMessage,
+  WEB_TOOL_NAMES,
+} from "../web/gate";
+import { webSearch } from "../web/search";
+import { fetchUrl } from "../web/fetchUrl";
+import {
+  browserClick,
+  browserNavigate,
+  browserScreenshot,
+  browserScroll,
+  browserSnapshot,
+  browserType,
+} from "../web/browser";
 
 const RUN_COMMAND_DEFAULT_TIMEOUT_MS = 60_000;
 const RUN_COMMAND_MAX_TIMEOUT_MS = 180_000;
@@ -211,6 +227,23 @@ export function getPendingEdit(id: string): PendingEdit | undefined {
 
 export function clearPendingEdit(id: string): void {
   pendingEdits.delete(id);
+}
+
+/** Re-register a History-restored edit so Apply / Compare still work. */
+export function restorePendingEdit(edit: PendingEdit): void {
+  if (!edit?.id) {
+    return;
+  }
+  pendingEdits.set(edit.id, {
+    id: edit.id,
+    relativePath: edit.relativePath,
+    absolutePath: edit.absolutePath,
+    newContent: edit.newContent ?? "",
+    oldContent: edit.oldContent ?? "",
+    kind: edit.kind === "delete" ? "delete" : "write",
+    source: edit.source,
+    replacePreview: edit.replacePreview,
+  });
 }
 
 export const AGENT_TOOLS: OllamaTool[] = [
@@ -588,14 +621,173 @@ export const AGENT_TOOLS: OllamaTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description:
+        "Search the public web (DuckDuckGo HTML) for current facts, external docs, library versions, changelogs, or errors not in the repo. " +
+        "Invent a precise query from context. Not for local codebase logic — use search_text/read_file. " +
+        "Available when blossom.web.enabled is true (default).",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Search query to run.",
+          },
+          max_results: {
+            type: "number",
+            description: "Max results (default 8, max 12).",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "fetch_url",
+      description:
+        "Fetch a specific URL and return readable text (HTML stripped). Use when you already have a URL " +
+        "(user, codebase, or web_search hit). Prefer over browser for read-only docs. Requires blossom.web.enabled.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "http(s) URL to fetch." },
+          max_chars: {
+            type: "number",
+            description: "Optional truncate length (default from blossom.web.fetchMaxChars).",
+          },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_navigate",
+      description:
+        "Open a URL in the local Playwright browser (system Chrome/Edge). Use only when you need live interaction, " +
+        "not for ordinary doc reading (prefer fetch_url). Requires blossom.web.enabled.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "http(s) URL to open." },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_snapshot",
+      description:
+        "List interactive elements (with refs) and visible text on the current browser page. " +
+        "Call after browser_navigate before click/type.",
+      parameters: {
+        type: "object",
+        properties: {
+          max_chars: {
+            type: "number",
+            description: "Max characters of text to return (default 12000).",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_click",
+      description: "Click an element by ref from the latest browser_snapshot (e.g. e3).",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: {
+            type: "string",
+            description: "Element ref from browser_snapshot (e.g. e1).",
+          },
+        },
+        required: ["ref"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_type",
+      description: "Type into an input/textarea by ref from browser_snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Element ref from browser_snapshot." },
+          text: { type: "string", description: "Text to type." },
+          submit: {
+            type: "boolean",
+            description: "If true, press Enter after typing.",
+          },
+        },
+        required: ["ref", "text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_scroll",
+      description: "Scroll the current browser page up or down.",
+      parameters: {
+        type: "object",
+        properties: {
+          direction: {
+            type: "string",
+            description: "up or down (default down).",
+          },
+          amount: {
+            type: "number",
+            description: "Pixel amount (default 600).",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_screenshot",
+      description:
+        "Capture a PNG of the current page under .blossom/web/. Local path only — no cloud vision.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Optional filename stem (default shot).",
+          },
+        },
+      },
+    },
+  },
 ];
 
 /** Tools shown in the prompt / Ollama native tool list for a profile. */
 export function toolsForProfile(profile: ToolProfile): OllamaTool[] {
+  const webOn = isWebEffectivelyEnabled();
   return AGENT_TOOLS.filter((t) => {
     const name = t.function.name;
     if (CATALOG_ALIAS_NAMES.has(name)) {
       return false;
+    }
+    if (isWebTool(name)) {
+      if (!webOn || profile === "minimal") {
+        return false;
+      }
+      // research + full when web enabled
+      return true;
     }
     if (profile === "minimal") {
       return MINIMAL_TOOL_NAMES.has(name);
@@ -606,6 +798,9 @@ export function toolsForProfile(profile: ToolProfile): OllamaTool[] {
     return true;
   });
 }
+
+/** Re-export for callers that need the web tool name set. */
+export { WEB_TOOL_NAMES };
 
 function workspaceFolders(): readonly vscode.WorkspaceFolder[] {
   const folders = vscode.workspace.workspaceFolders;
@@ -718,6 +913,9 @@ export async function runTool(
 ): Promise<ToolResult> {
   const args = parseArgs(rawArgs);
   try {
+    if (isWebTool(name) && !isWebEffectivelyEnabled()) {
+      return { ok: false, content: webDisabledMessage() };
+    }
     switch (name) {
       case "list_workspace_roots":
         return listWorkspaceRoots();
@@ -854,6 +1052,51 @@ export async function runTool(
           limit: typeof args.limit === "number" ? args.limit : undefined,
           timeout: typeof args.timeout === "number" ? args.timeout : undefined,
         });
+      case "web_search":
+        return await webSearch(
+          String(args.query ?? ""),
+          typeof args.max_results === "number"
+            ? args.max_results
+            : typeof args.maxResults === "number"
+              ? args.maxResults
+              : 8
+        );
+      case "fetch_url":
+        return await fetchUrl(
+          String(args.url ?? ""),
+          typeof args.max_chars === "number"
+            ? args.max_chars
+            : typeof args.maxChars === "number"
+              ? args.maxChars
+              : undefined
+        );
+      case "browser_navigate":
+        return await browserNavigate(String(args.url ?? ""));
+      case "browser_snapshot":
+        return await browserSnapshot(
+          typeof args.max_chars === "number"
+            ? args.max_chars
+            : typeof args.maxChars === "number"
+              ? args.maxChars
+              : 12_000
+        );
+      case "browser_click":
+        return await browserClick(String(args.ref ?? ""));
+      case "browser_type":
+        return await browserType(
+          String(args.ref ?? ""),
+          String(args.text ?? ""),
+          Boolean(args.submit)
+        );
+      case "browser_scroll":
+        return await browserScroll(
+          String(args.direction ?? "down"),
+          typeof args.amount === "number" ? args.amount : undefined
+        );
+      case "browser_screenshot":
+        return await browserScreenshot(
+          args.name != null ? String(args.name) : undefined
+        );
       default:
         return { ok: false, content: `Unknown tool: ${name}` };
     }

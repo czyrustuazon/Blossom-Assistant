@@ -56,3 +56,6 @@ temp/
 # Saved Blossom chat archives (local revisit / agent lookup)
 .blossom/chats/*
 !.blossom/chats/.gitkeep
+
+# Browser screenshots from opt-in web tools
+.blossom/web/*

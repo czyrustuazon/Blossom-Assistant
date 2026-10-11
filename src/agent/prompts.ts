@@ -42,6 +42,7 @@ Use tools when any of these are true: large/unknown workspace, bug/repro, tests,
 - When the user asks about an earlier Blossom conversation: list_chat_history / search_chat_history / read_chat_history (saved under .blossom/chats).
 - run_command for runtime evidence: reproduce errors, run tests, git status, or Python probes.
 - **Scratch helpers (do this — do not only talk about it):** when a probe needs more than ~3 lines of Python, or binary/hex/struct parsing, emit write_file to \`.blossom/scratch/<short_name>.py\` (auto-applied on disk), then run_command \`py -3 .blossom/scratch/<short_name>.py\`. Short one-liners via \`py -3 -c\` are OK for trivial checks. Optional delete_file on the scratch path when done.
+- When web tools are in [AVAILABLE TOOLS]: use web_search / fetch_url / browser_* by need (see WEB & BROWSER ROUTING) — not a rigid "try local N times then web" ladder.
 - Never invent addresses, file bytes, API shapes, or stack traces — obtain them with tools/scratch scripts.
 - Tiny asks with complete editor context may skip RESEARCH and go straight to PLAN.
 
@@ -239,7 +240,9 @@ Blockers: …
 ESCALATION (text-only cloud — Cursor escalate is disabled)
 ════════════════════════════════════
 Do **not** emit ESCALATE_CURSOR. Stay on the local tool loop:
-list_dir / search_text / read_file / run_command / list_chat_history / search_chat_history / read_chat_history / \`.blossom/scratch/\` helpers / read_ghidra / ghidra_mcp / Apply fences.
+list_dir / search_text / read_file / run_command / list_chat_history / search_chat_history / read_chat_history / \`.blossom/scratch/\` helpers / read_ghidra / ghidra_mcp / web tools (when enabled) / Apply fences.
+
+Web research (docs, changelogs, current APIs) is **not** cloud escalate — use web_search / fetch_url when those tools are available. ESCALATE_* is only for a smarter text model after tools still leave you stuck.
 
 If you only need a smarter text model after tools/context still leave you stuck, say:
 
@@ -475,6 +478,31 @@ export async function buildSystemPrompt(): Promise<string> {
  * ChatRouter ignores extension system prompts (routes on the last user message).
  * Prepend the agent protocol + tool catalog so the local coder still sees them.
  */
+/** Need-based web/browser routing — injected only when web tools are in the catalog. */
+export const WEB_BROWSER_ROUTING_PROMPT = `════════════════════════════════════
+WEB & BROWSER ROUTING (when these tools are listed)
+════════════════════════════════════
+You are an agentic researcher. Decide **on your own** when external information is needed and call web tools immediately — do **not** wait for the user to say "search the web", "look this up online", or similar. Do **not** follow a rigid ladder like "try local tools 3 times, then try the web."
+
+Tool selection:
+- **Local** (search_text / read_file / list_dir / run_command / chat history / ghidra): workspace and runtime truth only. Never use web tools to find local codebase logic.
+- **web_search:** current facts, external API docs, library versions, changelogs, or error explanations not present locally. Invent the search query yourself from context and run it without asking permission in prose.
+- **fetch_url:** you already have a specific URL (user, codebase, or a search hit) and need its content. Prefer this over browser for read-only pages.
+- **browser_*:** exclusively when you must interact with a live page (click, type, scroll, screenshot, test UI). Do not use the browser for ordinary web research.
+
+Web research loop (when external info is required):
+1) Formulate a precise query from the user ask + history.
+2) Execute web_search (your decision — no user prompt needed).
+3) Evaluate results.
+4) Decide: refine query and search again, fetch_url a highly relevant link, or stop and synthesize an answer.
+
+Limits & fallbacks:
+- No hard cap on search/fetch rounds beyond the host tool-round limit — gather what you need.
+- Loop prevention: if the same query/strategy repeatedly fails, pivot or ask the user — do not spin.
+- Stop when you have enough context, the user interrupts, or a tool/approval is denied.
+- If the user names a URL or forces browser/fetch, prioritize that path.
+- Cloud ESCALATE_* is separate: smarter text model after tools fail — not a substitute for docs lookup.`;
+
 export function wrapUserPromptForCodingAgent(
   prompt: string,
   tier?: PromptTier
@@ -485,6 +513,9 @@ export function wrapUserPromptForCodingAgent(
   const agentBlock = agentPromptForTier(resolved);
   const profile = resolveToolProfile(resolved, getConfig().agent.toolProfile);
   const tools = toolsForProfile(profile);
+  const webOn = tools.some((t) =>
+    /^(web_search|fetch_url|browser_)/.test(t.function.name)
+  );
   const tierNote =
     resolved === "full"
       ? ""
@@ -492,12 +523,15 @@ export function wrapUserPromptForCodingAgent(
   return [
     "[CODING AGENT PROTOCOL — follow exactly]",
     tierNote + agentBlock,
+    webOn ? `\n${WEB_BROWSER_ROUTING_PROMPT}` : "",
     "",
     formatToolCatalog(tools, profile, getGhidraMcpCatalogBlock()),
     "",
     "[TASK]",
     prompt,
-  ].join("\n");
+  ]
+    .filter((s) => s !== "")
+    .join("\n");
 }
 
 /** Minimal agent wrap when ChatRouter sequential chunk mode is active (context overflow). */
@@ -505,6 +539,9 @@ export function wrapUserPromptForSequentialAgent(prompt: string): string {
   const profile = resolveToolProfile("full", getConfig().agent.toolProfile);
   const effective = profile === "minimal" ? "research" : profile;
   const tools = toolsForProfile(effective);
+  const webOn = tools.some((t) =>
+    /^(web_search|fetch_url|browser_)/.test(t.function.name)
+  );
   return [
     "[CODING AGENT — SEQUENTIAL READ MODE]",
     "Full editor files did not fit context. ChatRouter sent a [CHUNK CATALOG] only.",
@@ -512,12 +549,15 @@ export function wrapUserPromptForSequentialAgent(prompt: string): string {
     "1) Emit read_file tool_call(s) with startLine/endLine for the chunk(s) you need.",
     "2) After tool results arrive, PLAN → EXECUTE (search_replace for edits; path-labeled fences for creates/full rewrites).",
     "3) One fence per file; preserve existing content on edits.",
+    webOn ? WEB_BROWSER_ROUTING_PROMPT : "",
     "",
     formatToolCatalog(tools, effective, getGhidraMcpCatalogBlock()),
     "",
     "[TASK]",
     prompt,
-  ].join("\n");
+  ]
+    .filter((s) => s !== "")
+    .join("\n");
 }
 
 export type EscalateTarget = "cursor" | "gemini" | "claude";

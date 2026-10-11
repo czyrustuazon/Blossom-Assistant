@@ -295,7 +295,12 @@
         },
         "blossom.agent.toolProfile": {
           "type": "string",
-          "enum": ["auto", "minimal", "research", "full"],
+          "enum": [
+            "auto",
+            "minimal",
+            "research",
+            "full"
+          ],
           "default": "auto",
           "description": "Tool catalog injected into coding prompts. auto = tiny→minimal, plan→research, full→full (aliases omitted from catalog)."
         },
@@ -311,7 +316,11 @@
         },
         "blossom.agent.stepMode": {
           "type": "string",
-          "enum": ["off", "confirmTools", "planSteps"],
+          "enum": [
+            "off",
+            "confirmTools",
+            "planSteps"
+          ],
           "default": "off",
           "description": "HITL gates: off (default), confirmTools (pause every N tool rounds), planSteps (pause after write/delete tools so you can review diffs)."
         },
@@ -469,7 +478,11 @@
         },
         "blossom.ghidra.transport": {
           "type": "string",
-          "enum": ["http", "mcp", "both"],
+          "enum": [
+            "http",
+            "mcp",
+            "both"
+          ],
           "default": "both",
           "description": "Ghidra integration: HTTP read_ghidra, stdio MCP ghidra_mcp, or both."
         },
@@ -492,13 +505,43 @@
           "type": "array",
           "default": [],
           "description": "MCP tools the local model may call (empty = safe default set). Add names as needed."
+        },
+        "blossom.web.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Public-internet research tools (web_search, fetch_url, browser_*). On by default so Blossom can search/fetch on its own when needed. Turn off to stay fully offline. Distinct from cloud LLM escalate (Gemini/Claude)."
+        },
+        "blossom.web.askBeforeUse": {
+          "type": "boolean",
+          "default": true,
+          "description": "When web is enabled, pause and ask before the first network tool call of each turn."
+        },
+        "blossom.web.fetchMaxChars": {
+          "type": "number",
+          "default": 20000,
+          "description": "Max characters returned by fetch_url after HTML→text extraction."
+        },
+        "blossom.web.browser.channel": {
+          "type": "string",
+          "enum": [
+            "chrome",
+            "msedge"
+          ],
+          "default": "chrome",
+          "description": "System browser channel for Playwright (playwright-core; does not download Chromium)."
+        },
+        "blossom.web.browser.headless": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the Playwright browser headless when using browser_* tools."
         }
       }
     }
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.26",
-    "@modelcontextprotocol/sdk": "^1.32.1"
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "playwright-core": "^1.51.0"
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

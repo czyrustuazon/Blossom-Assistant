@@ -126,6 +126,20 @@ export interface BlossomConfig {
       toolAllowlist: string[];
     };
   };
+  /**
+   * Public-internet research tools (web_search / fetch_url / browser_*).
+   * Default on; set false for fully offline. Distinct from cloud LLM escalate.
+   */
+  web: {
+    enabled: boolean;
+    /** Pause before the first network tool call of a turn. */
+    askBeforeUse: boolean;
+    fetchMaxChars: number;
+    browser: {
+      channel: "chrome" | "msedge";
+      headless: boolean;
+    };
+  };
 }
 
 export function getConfig(): BlossomConfig {
@@ -253,6 +267,17 @@ export function getConfig(): BlossomConfig {
         toolAllowlist: (cfg.get<string[]>("ghidra.mcp.toolAllowlist") ?? [])
           .map((s) => String(s || "").trim())
           .filter(Boolean),
+      },
+    },
+    web: {
+      enabled: cfg.get<boolean>("web.enabled") ?? true,
+      askBeforeUse: cfg.get<boolean>("web.askBeforeUse") ?? true,
+      fetchMaxChars: cfg.get<number>("web.fetchMaxChars") ?? 20_000,
+      browser: {
+        channel:
+          (cfg.get<string>("web.browser.channel") as "chrome" | "msedge") ??
+          "chrome",
+        headless: cfg.get<boolean>("web.browser.headless") ?? true,
       },
     },
   };

@@ -128,11 +128,32 @@ Do **not** close these by calling Gemini / Claude / Cursor cloud.
 
 ---
 
+## Web research
+
+Public-internet tools for the local agent — **on by default** (set `blossom.web.enabled` false for fully offline). Not vision and not cloud LLM escalate.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `blossom.web.enabled` | `true` | Expose `web_search`, `fetch_url`, `browser_*` in research/full tool profiles |
+| `blossom.web.askBeforeUse` | `true` | Confirm before the first network tool of a turn |
+| `blossom.web.fetchMaxChars` | `20000` | Cap on `fetch_url` text |
+| `blossom.web.browser.channel` | `chrome` | Playwright system browser (`chrome` or `msedge`) |
+| `blossom.web.browser.headless` | `true` | Headless Playwright |
+
+**Backends:** DuckDuckGo HTML search, HTTP fetch (HTML→text), `playwright-core` against installed Chrome/Edge (no Chromium download). Screenshots land under `.blossom/web/`.
+
+**Routing:** Need-based (local vs search vs fetch vs browser) — not “try local N times then web.” When `blossom.web.enabled` is on, Blossom searches/fetches on its own; no “search the web” phrase gate.
+
+**Key files:** `src/web/{search,fetchUrl,browser,gate}.ts`, wiring in `src/agent/tools.ts`, `prompts.ts`, `toolProtocol.ts`, `orchestrator.ts`.
+
+---
+
 ## Explicit non-goals (this hand-off)
 
 - Cloud vision (Gemini / Claude / Cursor Agent online) as the default fix for screenshots.
 - Changing the local coding GGUF into a multimodal model without a dedicated VL step.
 - Shipping OCR as the primary path for IDE UI.
+- Cloud LLM/vision as the default for stuck coding or screenshots (web research tools are separate and user-disableable).
 
 ---
 

@@ -92,6 +92,13 @@ import {
   type CommandDecision,
 } from "./commandPolicy";
 import { compactToolResult } from "./compactToolTranscript";
+import { closeBrowserSession } from "../web/browser";
+import {
+  confirmWebUse,
+  isWebTool,
+  resetWebTurnGate,
+  webStatusLabel,
+} from "../web/gate";
 import {
   buildChatRouterAgentTurn,
   parseToolCallFences,
@@ -808,6 +815,23 @@ export class AgentOrchestrator {
       const pattern = str("pattern") || str("query") || "";
       const path = str("path") || str("glob") || ".";
       return `pattern: ${clipOneLine(pattern, 80)}\npath: ${path}`;
+    }
+    if (name === "web_search") {
+      return `query: ${clipOneLine(str("query"), 100)}`;
+    }
+    if (name === "fetch_url" || name === "browser_navigate") {
+      return `url: ${clipOneLine(str("url"), 120)}`;
+    }
+    if (name === "browser_click" || name === "browser_type") {
+      const ref = str("ref");
+      const text = str("text");
+      return text ? `ref: ${ref}\ntext: ${clipOneLine(text, 80)}` : `ref: ${ref}`;
+    }
+    if (name === "browser_scroll") {
+      return `direction: ${str("direction") || "down"}`;
+    }
+    if (name === "browser_screenshot") {
+      return str("name") ? `name: ${str("name")}` : "viewport PNG";
     }
 
     const entries = Object.entries(obj);
@@ -2321,6 +2345,7 @@ export class AgentOrchestrator {
     const loopTools = toolsForProfile(effectiveProfile);
     setActiveToolProfile(effectiveProfile);
     clearSearchLineHints();
+    resetWebTurnGate();
     events.onStatus(
       chatRouter
         ? `Blossom agent loop (tools:${effectiveProfile})…`
@@ -2523,6 +2548,36 @@ export class AgentOrchestrator {
             }
           }
 
+          if (isWebTool(name)) {
+            const detail =
+              String(args.query ?? args.url ?? args.ref ?? "").trim() ||
+              this.toolDetailForUi(name, args);
+            events.onStatus(`Waiting for OK to use network (${name})…`);
+            const allowed = await confirmWebUse(name, detail, {
+              fastMode: this.fastMode,
+              signal,
+            });
+            if (!allowed) {
+              const denied =
+                "User denied network/web tool use (or web is disabled). Do not invent search/fetch results; use local tools or ask the user to enable blossom.web.enabled.";
+              events.onStatus(`Denied web: ${name}`);
+              transcript.push({
+                round: round + 1,
+                name,
+                args,
+                result: denied,
+                ok: false,
+              });
+              this.turnToolFailureNotes.push(
+                `${name} denied`.slice(0, 160)
+              );
+              if (!chatRouter) {
+                ollamaMessages.push({ role: "tool", content: denied });
+              }
+              continue;
+            }
+          }
+
           // Diff / delete cards are the UI for edits — skip terse tool rows.
           // Approval card already shows the command; only log allowlisted / other tools.
           const editToolUi =
@@ -2538,7 +2593,9 @@ export class AgentOrchestrator {
           events.onStatus(
             name === "run_command"
               ? `Running: ${String(args.command ?? "").trim()}…`
-              : `Running ${name}…`
+              : isWebTool(name)
+                ? webStatusLabel(name)
+                : `Running ${name}…`
           );
           const toolResult = await runTool(name, args);
           if (name === "run_command" && toolResult.ok) {
@@ -2641,6 +2698,7 @@ export class AgentOrchestrator {
     };
     } finally {
       setActiveToolProfile("full");
+      await closeBrowserSession();
     }
   }
 }

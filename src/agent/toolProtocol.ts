@@ -85,7 +85,13 @@ export function toOllamaToolCalls(calls: ParsedToolCall[]): OllamaToolCall[] {
   }));
 }
 
-function catalogRules(profile: ToolProfile): string[] {
+function catalogRules(profile: ToolProfile, hasWebTools: boolean): string[] {
+  const webRules = hasWebTools
+    ? [
+        "- Web: pick web_search / fetch_url / browser_* by need — not local-N-then-web. Local tools for repo; browser only for live UI interaction.",
+        "- After web_search: refine, fetch_url a good link, or stop and answer. Do not invent search results.",
+      ]
+    : [];
   if (profile === "minimal") {
     return [
       "Rules:",
@@ -102,6 +108,7 @@ function catalogRules(profile: ToolProfile): string[] {
       "- Prefer a scratch .py over long `python -c` one-liners when the probe needs >~3 lines.",
       "- After search_text, read_file with startLine/endLine around hits (avoid whole-file reads).",
       "- Use run_command for repros/tests; ghidra_mcp / read_ghidra when Ghidra is connected for RE truth.",
+      ...webRules,
       "- Finish with PLAN (+ ### Summary of the plan).",
     ];
   }
@@ -115,6 +122,7 @@ function catalogRules(profile: ToolProfile): string[] {
     "- Actionable coding asks: RESEARCH → PLAN → EXECUTE (search_replace for edits) → VERIFY → ### Summary.",
     "- patch_*.py / tools/*.py: run `python path --dry-run` with exit 0 before Apply.",
     "- RE/patch tasks: read_ghidra when Ghidra bridge connected — before ARM byte edits.",
+    ...webRules,
     "- Do not emit ### Summary until you are finished (no more tool_call fences).",
   ];
 }
@@ -141,6 +149,9 @@ export function formatToolCatalog(
   const includeGhidraExtra =
     extra &&
     tools.some((t) => t.function.name === "ghidra_mcp" || t.function.name === "read_ghidra");
+  const hasWebTools = tools.some((t) =>
+    /^(web_search|fetch_url|browser_)/.test(t.function.name)
+  );
   return [
     `[AVAILABLE TOOLS — profile:${profile}; ChatRouter has no native function-calling; use fences]`,
     "To call a tool, emit one or more fences (and nothing that pretends the tool already ran):",
@@ -149,7 +160,7 @@ export function formatToolCatalog(
     '{"name":"search_text","arguments":{"query":"def foo"}}',
     "```",
     "",
-    ...catalogRules(profile),
+    ...catalogRules(profile, hasWebTools),
     "",
     "Catalog:",
     ...lines,
@@ -193,6 +204,9 @@ export function buildChatRouterAgentTurn(
   opts?: { scratchpadHint?: string }
 ): string {
   const transcript = formatToolTranscript(entries);
+  const usedWeb = entries.some((e) =>
+    /^(web_search|fetch_url|browser_)/.test(e.name)
+  );
   const continueBlock =
     entries.length === 0
       ? [
@@ -201,6 +215,7 @@ export function buildChatRouterAgentTurn(
           "If the ask is plan-first (where to begin / architecture / organize / how should we…): RESEARCH then PLAN only — no file writes yet.",
           "If the ask is a tiny actionable edit and editor context is enough, you may skip tools and go PLAN → EXECUTE.",
           "After search_text, prefer ranged read_file (startLine/endLine) over whole files.",
+          "If web tools are listed and you need external docs/facts: web_search or fetch_url immediately by need (not after N local failures). Browser only for live UI interaction.",
         ].join("\n")
       : [
           "[CONTINUE — agent round]",
@@ -211,6 +226,9 @@ export function buildChatRouterAgentTurn(
           "Actionable asks: finish with PLAN → EXECUTE (all required files) → VERIFY → ### Summary.",
           "Do not repeat unchanged prior results. Prefer run_command / Python when you need runtime evidence.",
           "After search_text, prefer ranged read_file (startLine/endLine) over whole files.",
+          usedWeb
+            ? "Web loop: refine search, fetch_url a strong hit, use browser only if interaction is required, or stop and answer — do not spin on the same failing query."
+            : "If listed web tools would unlock docs/APIs/changelogs, use them by need; do not invent external facts.",
         ].join("\n");
 
   const hint = (opts?.scratchpadHint || "").trim();
